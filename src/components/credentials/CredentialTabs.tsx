@@ -5,17 +5,26 @@ import { useBatchTest } from '@/hooks/useBatchTest'
 import { getProviderColor } from '@/utils/keyUtils'
 import { getEffectiveStatus, isExpiredStatus } from '@/utils/statusUtils'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
-import CredentialTable from './CredentialTable'
+import CredentialTable, { type SortMode } from './CredentialTable'
+import UploadModal from './UploadModal'
 import type { AuthFile } from '@/types/api'
-type SortMode = 'default' | 'quota-first' | 'status-first'
 type QuickFilter = 'all' | 'expired' | 'quota' | 'disabled' | 'error' | 'has-quota' | 'other' | 're-enable'
 const SORT_MODE_KEY = 'cliproxy_sort_mode'
+
+const VALID_SORT_MODES: SortMode[] = [
+  'default', 'quota-first', 'status-first',
+  'name-asc', 'name-desc',
+  'quota-asc', 'quota-desc',
+  'status-asc', 'status-desc',
+  'reset-asc', 'reset-desc',
+  'refresh-asc', 'refresh-desc',
+]
 
 function loadSortMode(): SortMode {
   if (typeof window === 'undefined') return 'default'
   const value = window.localStorage.getItem(SORT_MODE_KEY)
-  if (value === 'quota-first' || value === 'status-first' || value === 'default') {
-    return value
+  if (value && (VALID_SORT_MODES as string[]).includes(value)) {
+    return value as SortMode
   }
   return 'default'
 }
@@ -28,6 +37,7 @@ export default function CredentialTabs() {
   const [searchQuery, setSearchQuery] = useState('')
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all')
   const [bulkProgress, setBulkProgress] = useState<{ label: string; done: number; total: number } | null>(null)
+  const [uploadOpen, setUploadOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -143,9 +153,38 @@ export default function CredentialTabs() {
 
   const displayFiles = useMemo(() => {
     const list = [...filteredFiles]
+
     if (sortMode === 'default') return list
 
-    if (sortMode === 'quota-first') {
+    if (sortMode === 'name-asc') {
+      return list.sort((a, b) => a.name.localeCompare(b.name))
+    }
+    if (sortMode === 'name-desc') {
+      return list.sort((a, b) => b.name.localeCompare(a.name))
+    }
+
+    if (sortMode === 'status-asc' || sortMode === 'status-first') {
+      return list.sort((a, b) => {
+        const rankDiff = getStatusRank(a) - getStatusRank(b)
+        if (rankDiff !== 0) return rankDiff
+        const bScore = getQuotaRemainingPercent(b) ?? -1
+        const aScore = getQuotaRemainingPercent(a) ?? -1
+        if (bScore !== aScore) return bScore - aScore
+        return a.name.localeCompare(b.name)
+      })
+    }
+    if (sortMode === 'status-desc') {
+      return list.sort((a, b) => {
+        const rankDiff = getStatusRank(b) - getStatusRank(a)
+        if (rankDiff !== 0) return rankDiff
+        const aScore = getQuotaRemainingPercent(a) ?? -1
+        const bScore = getQuotaRemainingPercent(b) ?? -1
+        if (aScore !== bScore) return aScore - bScore
+        return a.name.localeCompare(b.name)
+      })
+    }
+
+    if (sortMode === 'quota-first' || sortMode === 'quota-desc') {
       return list.sort((a, b) => {
         const aScore = getQuotaRemainingPercent(a) ?? -1
         const bScore = getQuotaRemainingPercent(b) ?? -1
@@ -153,15 +192,46 @@ export default function CredentialTabs() {
         return a.name.localeCompare(b.name)
       })
     }
+    if (sortMode === 'quota-asc') {
+      return list.sort((a, b) => {
+        const aScore = getQuotaRemainingPercent(a) ?? 101
+        const bScore = getQuotaRemainingPercent(b) ?? 101
+        if (aScore !== bScore) return aScore - bScore
+        return a.name.localeCompare(b.name)
+      })
+    }
 
-    return list.sort((a, b) => {
-      const rankDiff = getStatusRank(a) - getStatusRank(b)
-      if (rankDiff !== 0) return rankDiff
-      const bScore = getQuotaRemainingPercent(b) ?? -1
-      const aScore = getQuotaRemainingPercent(a) ?? -1
-      if (bScore !== aScore) return bScore - aScore
-      return a.name.localeCompare(b.name)
-    })
+    if (sortMode === 'reset-asc') {
+      return list.sort((a, b) => {
+        const aTime = a.next_retry_after ? new Date(a.next_retry_after).getTime() : Infinity
+        const bTime = b.next_retry_after ? new Date(b.next_retry_after).getTime() : Infinity
+        return aTime - bTime
+      })
+    }
+    if (sortMode === 'reset-desc') {
+      return list.sort((a, b) => {
+        const aTime = a.next_retry_after ? new Date(a.next_retry_after).getTime() : -Infinity
+        const bTime = b.next_retry_after ? new Date(b.next_retry_after).getTime() : -Infinity
+        return bTime - aTime
+      })
+    }
+
+    if (sortMode === 'refresh-asc') {
+      return list.sort((a, b) => {
+        const aTime = a.last_refresh ? new Date(a.last_refresh).getTime() : Infinity
+        const bTime = b.last_refresh ? new Date(b.last_refresh).getTime() : Infinity
+        return aTime - bTime
+      })
+    }
+    if (sortMode === 'refresh-desc') {
+      return list.sort((a, b) => {
+        const aTime = a.last_refresh ? new Date(a.last_refresh).getTime() : -Infinity
+        const bTime = b.last_refresh ? new Date(b.last_refresh).getTime() : -Infinity
+        return bTime - aTime
+      })
+    }
+
+    return list
   }, [filteredFiles, sortMode, testResults])
 
   const expiredFiles = useMemo(
@@ -377,13 +447,23 @@ export default function CredentialTabs() {
           <select
             value={sortMode}
             onChange={(e) => setSortMode(e.target.value as SortMode)}
-            className="text-2xs text-subtle bg-canvas border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-coral"
+            className="text-2xs text-subtle bg-canvas border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-coral sr-only"
             title="排序方式"
+            aria-hidden="true"
           >
             <option value="default">默认排序</option>
             <option value="status-first">状态优先</option>
             <option value="quota-first">额度剩余优先</option>
           </select>
+
+          <button
+            onClick={() => setUploadOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium text-subtle rounded hover:bg-black/5 hover:text-ink transition-colors"
+            title="上传凭证文件"
+          >
+            <UploadIcon />
+            上传
+          </button>
 
           <button
             onClick={refresh}
@@ -533,7 +613,9 @@ export default function CredentialTabs() {
         </span>
       </div>
 
-      <CredentialTable files={displayFiles} loading={loading} />
+      <CredentialTable files={displayFiles} loading={loading} sortMode={sortMode} onSortChange={setSortMode} />
+
+      {uploadOpen && <UploadModal onClose={() => setUploadOpen(false)} />}
     </div>
   )
 }
@@ -566,6 +648,14 @@ function QuickFilterButton({
     >
       {label}
     </button>
+  )
+}
+
+function UploadIcon() {
+  return (
+    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+    </svg>
   )
 }
 
