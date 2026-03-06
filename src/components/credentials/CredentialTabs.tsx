@@ -94,10 +94,9 @@ export default function CredentialTabs() {
   function hasAvailableQuota(file: AuthFile): boolean {
     const result = testResults[file.name]
 
-    const codexWindow = result?.quota?.rate_limit?.primary_window
-    if (codexWindow) {
-      const usedPercent = codexWindow.used_percent ?? 100
-      return usedPercent < 100
+    const codexRateLimit = result?.quota?.rate_limit
+    if (codexRateLimit) {
+      return codexRateLimit.allowed && !codexRateLimit.limit_reached
     }
 
     const copilotSnapshot = result?.copilotQuota?.quota_snapshots?.premium_interactions
