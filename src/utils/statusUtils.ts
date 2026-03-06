@@ -11,6 +11,10 @@ function parseTime(value: string | undefined): number | null {
 export function getEffectiveStatus(file: AuthFile, testResult: TestResult | undefined): EffectiveStatus {
   if (!testResult) return file.status
 
+  if (file.disabled && (testResult.status === 'quota' || testResult.status === 'expired')) {
+    return testResult.status
+  }
+
   const fileTime = parseTime(file.last_refresh ?? file.updated_at ?? file.modtime)
   if (fileTime !== null && testResult.testedAt < fileTime) {
     return file.status
