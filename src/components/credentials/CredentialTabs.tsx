@@ -145,7 +145,7 @@ export default function CredentialTabs() {
       if (quickFilter === 'disabled') return f.disabled && status !== 'quota'
       if (quickFilter === 'error') return status === 'error'
       if (quickFilter === 'has-quota') return !f.disabled && hasAvailableQuota(f)
-      if (quickFilter === 'other') return status !== 'quota' && !(!f.disabled && hasAvailableQuota(f))
+      if (quickFilter === 'other') return !isExpiredStatus(status) && status !== 'quota' && !(!f.disabled && hasAvailableQuota(f))
       if (quickFilter === 're-enable') return f.disabled && hasAvailableQuota(f)
       return true
     })
@@ -309,9 +309,10 @@ export default function CredentialTabs() {
   const allOtherFiles = useMemo(
     () => filesInProviderScope.filter((f) => {
       const s = getEffectiveStatus(f, testResults[f.name])
+      const isExpired = isExpiredStatus(s)
       const isQuota = s === 'quota'
       const isHasQuota = !f.disabled && hasAvailableQuota(f)
-      return !isQuota && !isHasQuota
+      return !isExpired && !isQuota && !isHasQuota
     }),
     [filesInProviderScope, testResults]
   )
