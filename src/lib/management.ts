@@ -47,6 +47,9 @@ interface ApiCallResponse {
   body: string
 }
 
+const CODEX_USAGE_CHALLENGE_MAX_RETRIES = 3
+const CODEX_USAGE_CHALLENGE_BASE_DELAY_MS = 1200
+
 function getHeaderValues(headers: Record<string, string[]>, name: string): string[] {
   const target = name.toLowerCase()
   for (const [key, values] of Object.entries(headers)) {
@@ -78,6 +81,21 @@ function isCloudflareChallenge(res: ApiCallResponse): boolean {
   return false
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function getCodexChallengeDelayMs(retryIndex: number): number {
+  return CODEX_USAGE_CHALLENGE_BASE_DELAY_MS * (retryIndex + 1)
+}
+
+function getChallengeBlockedMessage(retryCount: number): string {
+  if (retryCount <= 0) return 'Cloudflare challenge blocked usage endpoint'
+  return `Cloudflare challenge blocked usage endpoint after ${retryCount} retries`
+}
+
 async function requestCodexUsage(client: ApiClient, authFile: AuthFile): Promise<ApiCallResponse> {
   return client.post<ApiCallResponse>('/api-call', {
     auth_index: authFile.auth_index,
@@ -91,6 +109,22 @@ async function requestCodexUsage(client: ApiClient, authFile: AuthFile): Promise
       Originator: 'codex_cli_rs',
     },
   })
+}
+
+async function requestCodexUsageWithChallengeRetry(
+  client: ApiClient,
+  authFile: AuthFile
+): Promise<{ response: ApiCallResponse; challengeRetries: number }> {
+  let response = await requestCodexUsage(client, authFile)
+  let challengeRetries = 0
+
+  while (isCloudflareChallenge(response) && challengeRetries < CODEX_USAGE_CHALLENGE_MAX_RETRIES) {
+    await sleep(getCodexChallengeDelayMs(challengeRetries))
+    challengeRetries += 1
+    response = await requestCodexUsage(client, authFile)
+  }
+
+  return { response, challengeRetries }
 }
 
 export async function testAuthFile(
@@ -113,19 +147,33 @@ async function testCodexFile(
   const now = Date.now()
 
   try {
-    const res = await requestCodexUsage(client, authFile)
+    const initialAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
+    const res = initialAttempt.response
+
+    if (isCloudflareChallenge(res)) {
+      return {
+        status: 'error',
+        statusCode: res.status_code,
+        message: getChallengeBlockedMessage(initialAttempt.challengeRetries),
+        testedAt: now,
+      }
+    }
 
     if (res.status_code === 401 || res.status_code === 403) {
-      if (isCloudflareChallenge(res)) {
-        return { status: 'error', statusCode: res.status_code, message: 'Cloudflare challenge blocked usage endpoint', testedAt: now }
-      }
-
       try {
-        const retry = await requestCodexUsage(client, authFile)
-        if (retry.status_code === 401 || retry.status_code === 403) {
-          if (isCloudflareChallenge(retry)) {
-            return { status: 'error', statusCode: retry.status_code, message: 'Cloudflare challenge blocked usage endpoint', testedAt: now }
+        const retryAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
+        const retry = retryAttempt.response
+
+        if (isCloudflareChallenge(retry)) {
+          return {
+            status: 'error',
+            statusCode: retry.status_code,
+            message: getChallengeBlockedMessage(retryAttempt.challengeRetries),
+            testedAt: now,
           }
+        }
+
+        if (retry.status_code === 401 || retry.status_code === 403) {
           return { status: 'expired', statusCode: retry.status_code, testedAt: now }
         }
         if (retry.status_code === 429) {
