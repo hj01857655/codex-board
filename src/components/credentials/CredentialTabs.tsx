@@ -346,24 +346,6 @@ export default function CredentialTabs() {
     [filesInProviderScope, testResults]
   )
 
-  useEffect(() => {
-    if (quickFilter === 'other' && allOtherFiles.length === 0) {
-      setQuickFilter('all')
-    }
-  }, [quickFilter, allOtherFiles.length])
-
-  useEffect(() => {
-    if (quickFilter === 'can-enable' && reenableQuotaRecoveredFiles.length === 0) {
-      setQuickFilter('all')
-    }
-  }, [quickFilter, reenableQuotaRecoveredFiles.length])
-
-  useEffect(() => {
-    if (quickFilter === 'can-disable' && canDisableQuotaFiles.length === 0) {
-      setQuickFilter('all')
-    }
-  }, [quickFilter, canDisableQuotaFiles.length])
-
   const allExpiredFiles = useMemo(
     () => filesInProviderScope.filter((f) => {
       if (isHiddenTestingStatus(f)) return false
@@ -522,7 +504,7 @@ export default function CredentialTabs() {
             disabled={isRunning || displayFiles.length === 0}
             className="flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium text-coral rounded hover:bg-coral/10 disabled:opacity-50 transition-colors"
           >
-            批量测试
+            测试当前类别
           </button>
 
           <div className="relative" ref={menuRef}>
@@ -622,13 +604,11 @@ export default function CredentialTabs() {
           onClick={() => setQuickFilter('has-quota')}
           label={`有配额 (${allHasQuotaFiles.length})`}
         />
-        {allOtherFiles.length > 0 && (
-          <QuickFilterButton
-            active={quickFilter === 'other'}
-            onClick={() => setQuickFilter('other')}
-            label={`其他 (${allOtherFiles.length})`}
-          />
-        )}
+        <QuickFilterButton
+          active={quickFilter === 'other'}
+          onClick={() => setQuickFilter('other')}
+          label={`其他 (${allOtherFiles.length})`}
+        />
         <QuickFilterButton
           active={quickFilter === 'can-disable'}
           onClick={() => setQuickFilter('can-disable')}
