@@ -2,7 +2,6 @@ import { useRef, useState } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { fetchAuthFiles } from '@/lib/management'
 import { saveConnection, clearConnection, loadConnection } from '@/lib/storage'
-import { createClient } from '@/lib/api'
 import type { ConnectionConfig } from '@/types/api'
 
 export function useConnection() {
@@ -25,15 +24,16 @@ export function useConnection() {
     return loadRequestIdRef.current === requestId
   }
 
-  async function loadFilesWithClientGuard(
-    freshClient: ReturnType<typeof createClient>,
-    requestId: number
-  ): Promise<boolean> {
-    const files = await fetchAuthFiles(freshClient)
+  async function loadFilesWithClientGuard(requestId: number): Promise<boolean> {
+    const committedClient = useCredStore.getState().client
+    if (!committedClient) {
+      return false
+    }
+    const files = await fetchAuthFiles(committedClient)
     if (!isCurrentLoadRequest(requestId)) {
       return false
     }
-    if (useCredStore.getState().client !== freshClient) {
+    if (useCredStore.getState().client !== committedClient) {
       return false
     }
     setFiles(files)
@@ -51,9 +51,8 @@ export function useConnection() {
     const requestId = nextLoadRequestId()
 
     try {
-      const freshClient = createClient(config.endpoint, config.managementKey, config.useProxy)
       setConnection(config)
-      const committed = await loadFilesWithClientGuard(freshClient, requestId)
+      const committed = await loadFilesWithClientGuard(requestId)
       if (!committed) return
       saveConnection(config)
     } catch (err) {
@@ -90,9 +89,8 @@ export function useConnection() {
     setLoading(true)
     const requestId = nextLoadRequestId()
     try {
-      const freshClient = createClient(saved.endpoint, saved.managementKey, saved.useProxy)
       setConnection(saved)
-      await loadFilesWithClientGuard(freshClient, requestId)
+      await loadFilesWithClientGuard(requestId)
     } catch (err) {
       if (!isCurrentLoadRequest(requestId)) return
       storeDisconnect()
@@ -113,7 +111,7 @@ export function useConnection() {
 
     setRefreshing(true)
     try {
-      await loadFilesWithClientGuard(freshClient, requestId)
+      await loadFilesWithClientGuard(requestId)
     } finally {
       if (!isCurrentLoadRequest(requestId)) return
       setRefreshing(false)
@@ -129,4 +127,3 @@ export function useConnection() {
     isConnecting,
   }
 }
-
