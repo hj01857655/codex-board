@@ -38,23 +38,15 @@ export default function UsagePanel() {
 
   return (
     <div className="bg-surface border border-border rounded-lg shadow-card overflow-hidden">
-      <button
-        onClick={handleToggle}
-        className="w-full flex items-center justify-between px-5 py-4 hover:bg-border/20 transition-colors"
-      >
-        <span className="text-sm font-medium text-ink">使用统计</span>
-        <div className="flex items-center gap-3">
-          {expanded && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation()
-                load()
-              }}
-              className="text-2xs text-subtle hover:text-coral transition-colors"
-            >
-              刷新
-            </button>
-          )}
+      <div className="w-full flex items-center justify-between gap-3 px-5 py-4 hover:bg-border/20 transition-colors">
+        <button
+          type="button"
+          onClick={handleToggle}
+          className="flex-1 min-w-0 flex items-center justify-between"
+          aria-expanded={expanded}
+          aria-controls="usage-panel-content"
+        >
+          <span className="text-sm font-medium text-ink">使用统计</span>
           <svg
             className={`w-4 h-4 text-subtle transition-transform ${expanded ? 'rotate-180' : ''}`}
             fill="none"
@@ -64,11 +56,22 @@ export default function UsagePanel() {
           >
             <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
           </svg>
-        </div>
-      </button>
+        </button>
+
+        {expanded && (
+          <button
+            type="button"
+            onClick={load}
+            className="text-2xs text-subtle hover:text-coral transition-colors"
+            aria-label="刷新使用统计"
+          >
+            刷新
+          </button>
+        )}
+      </div>
 
       {expanded && (
-        <div className="border-t border-border px-5 py-4">
+        <div id="usage-panel-content" className="border-t border-border px-5 py-4">
           {loading && (
             <div className="grid grid-cols-2 gap-3">
               {Array.from({ length: 4 }).map((_, i) => (

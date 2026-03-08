@@ -51,6 +51,8 @@ export default function ConnectionPanel() {
             onClick={() => setKeyVisible((v) => !v)}
             className="flex items-center gap-1.5 font-mono-key text-ink tracking-widest hover:text-coral transition-colors"
             title={keyVisible ? '隐藏密钥' : '显示密钥'}
+            aria-label={keyVisible ? '隐藏密钥' : '显示密钥'}
+            aria-pressed={keyVisible}
           >
             {keyVisible ? connection.managementKey : '••••••••'}
             <svg className="w-3 h-3 text-subtle flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
