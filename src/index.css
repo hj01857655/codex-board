@@ -8,7 +8,7 @@
     --color-border: 232 230 225;
     --color-muted: 200 196 188;
     --color-ink: 26 26 26;
-    --color-subtle: 107 101 96;
+    --color-subtle: 86 81 76;
   }
 
   :root.dark,
@@ -20,7 +20,7 @@
     --color-border: 42 41 40;
     --color-muted: 118 112 104;
     --color-ink: 242 240 236;
-    --color-subtle: 196 188 178;
+    --color-subtle: 214 206 196;
   }
 
   body {
@@ -60,27 +60,59 @@
   }
 
   .checkbox-ui {
-    @apply appearance-none w-4 h-4 rounded border border-border bg-canvas cursor-pointer relative transition-colors;
+    @apply appearance-none w-5 h-5 rounded-md border-2 cursor-pointer relative transition-all duration-150;
+    border-color: #6f665c;
+    background-color: #fffefb;
+    box-shadow: 0 1px 2px rgba(26, 26, 26, 0.14);
+  }
+
+  .dark .checkbox-ui,
+  :root.dark .checkbox-ui,
+  :root[data-theme='dark'] .checkbox-ui {
+    border-color: #a0978d;
+    background-color: #2b2926;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  }
+
+  .checkbox-ui:hover {
+    border-color: #4e4740;
   }
 
   .checkbox-ui:checked {
     @apply bg-coral border-coral;
+    box-shadow: 0 0 0 2px rgba(201, 100, 66, 0.18);
   }
 
   .checkbox-ui:checked::after {
     content: '';
     position: absolute;
-    left: 4px;
-    top: 1px;
-    width: 4px;
-    height: 8px;
+    left: 6px;
+    top: 2px;
+    width: 5px;
+    height: 10px;
     border: solid #fff;
-    border-width: 0 2px 2px 0;
+    border-width: 0 2.5px 2.5px 0;
     transform: rotate(45deg);
   }
 
+  .checkbox-ui:indeterminate {
+    @apply bg-coral border-coral;
+    box-shadow: 0 0 0 2px rgba(201, 100, 66, 0.18);
+  }
+
+  .checkbox-ui:indeterminate::after {
+    content: '';
+    position: absolute;
+    left: 4px;
+    top: 7px;
+    width: 10px;
+    height: 2px;
+    border-radius: 9999px;
+    background: #fff;
+  }
+
   .checkbox-ui:focus-visible {
-    outline: 2px solid rgba(201, 100, 66, 0.45);
-    outline-offset: 1px;
+    outline: 3px solid rgba(201, 100, 66, 0.45);
+    outline-offset: 2px;
   }
 }

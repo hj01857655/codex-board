@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCredStore } from '@/store/credStore'
 import CredentialRow from './CredentialRow'
@@ -62,15 +62,65 @@ function getDirection(mode: SortMode | undefined, col: SortCol): 'asc' | 'desc' 
 
 export default function CredentialTable({ files, loading, sortMode, onSortChange }: CredentialTableProps) {
   const selected = useCredStore((s) => s.selected)
-  const { selectAll, clearSelection } = useCredStore.getState()
+  const { selectAll, deselectNames, toggleSelect, clearSelection } = useCredStore.getState()
+  const lastToggledIndexRef = useRef<number | null>(null)
 
-  const allNames = files.map((f) => f.name)
-  const allSelected = allNames.length > 0 && allNames.every((n) => selected.has(n))
-  const someSelected = allNames.some((n) => selected.has(n))
+  const allNames = useMemo(() => files.map((f) => f.name), [files])
+  const selectedInViewCount = useMemo(() => {
+    let count = 0
+    for (const file of files) {
+      if (selected.has(file.name)) count += 1
+    }
+    return count
+  }, [files, selected])
+  const allSelected = allNames.length > 0 && selectedInViewCount === allNames.length
+  const someSelected = selectedInViewCount > 0 && !allSelected
+  const totalSelectedCount = selected.size
+
+  const selectedInViewNames = useMemo(
+    () => files.filter((file) => selected.has(file.name)).map((file) => file.name),
+    [files, selected]
+  )
 
   function handleSelectAll(checked: boolean) {
     if (checked) selectAll(allNames)
-    else clearSelection()
+    else deselectNames(allNames)
+  }
+
+  function handleInvertPageSelection() {
+    if (allNames.length === 0) return
+
+    const toSelect: string[] = []
+    const toDeselect: string[] = []
+    for (const name of allNames) {
+      if (selected.has(name)) toDeselect.push(name)
+      else toSelect.push(name)
+    }
+    if (toDeselect.length > 0) deselectNames(toDeselect)
+    if (toSelect.length > 0) selectAll(toSelect)
+  }
+
+  function handleRowToggle(index: number, shiftKey: boolean) {
+    const file = files[index]
+    if (!file) return
+
+    if (!shiftKey || lastToggledIndexRef.current === null) {
+      toggleSelect(file.name)
+      lastToggledIndexRef.current = index
+      return
+    }
+
+    const start = Math.min(lastToggledIndexRef.current, index)
+    const end = Math.max(lastToggledIndexRef.current, index)
+    const rangeNames = files.slice(start, end + 1).map((item) => item.name)
+    const shouldSelect = !selected.has(file.name)
+
+    if (shouldSelect) {
+      selectAll(rangeNames)
+    } else {
+      deselectNames(rangeNames)
+    }
+    lastToggledIndexRef.current = index
   }
 
   function handleColSort(col: SortCol) {
@@ -92,6 +142,28 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
   }
 
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+
+      const isSelectAll = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a'
+      if (isSelectAll && allNames.length > 0) {
+        event.preventDefault()
+        selectAll(allNames)
+        return
+      }
+
+      if (event.key === 'Escape' && totalSelectedCount > 0) {
+        event.preventDefault()
+        clearSelection()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [allNames, clearSelection, selectAll, totalSelectedCount])
 
   const virtualizer = useVirtualizer({
     count: files.length,
@@ -119,9 +191,46 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
 
   return (
     <div className="overflow-hidden">
+      <div className="px-4 py-2 border-b border-border bg-canvas">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-xs text-subtle">
+            当前页已选 <span className="font-semibold text-ink tabular-nums">{selectedInViewCount}</span> / {allNames.length}，
+            总选中 <span className="font-semibold text-ink tabular-nums">{totalSelectedCount}</span>
+            <span className="ml-2 opacity-80">Shift 连选 · Ctrl/Cmd+A 全选本页 · Esc 清空</span>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => selectAll(allNames)}
+              disabled={allNames.length === 0 || allSelected}
+              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-xs text-subtle hover:text-ink hover:border-ink disabled:opacity-45 transition-colors"
+            >
+              全选本页
+            </button>
+            <button
+              type="button"
+              onClick={handleInvertPageSelection}
+              disabled={allNames.length === 0}
+              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-xs text-subtle hover:text-ink hover:border-ink disabled:opacity-45 transition-colors"
+            >
+              反选本页
+            </button>
+            <button
+              type="button"
+              onClick={() => deselectNames(selectedInViewNames)}
+              disabled={selectedInViewNames.length === 0}
+              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-xs text-subtle hover:text-ink hover:border-ink disabled:opacity-45 transition-colors"
+            >
+              清空本页
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div className="bg-surface border-b border-border">
-        <div className="flex items-center text-2xs font-medium text-subtle uppercase tracking-wide">
-          <div className="pl-4 pr-2 py-3 w-10 flex-shrink-0">
+        <div className="flex items-center text-xs font-semibold text-subtle tracking-wide">
+          <div className="pl-4 pr-2 py-3 w-12 flex-shrink-0 flex items-center">
             <input
               type="checkbox"
               checked={allSelected}
@@ -130,6 +239,7 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
               }}
               onChange={(e) => handleSelectAll(e.target.checked)}
               className="checkbox-ui"
+              aria-label="全选当前列表"
             />
           </div>
 
@@ -218,6 +328,7 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
                   <CredentialRow
                     file={file}
                     isSelected={selected.has(file.name)}
+                    onToggleSelect={(shiftKey) => handleRowToggle(virtualItem.index, shiftKey)}
                   />
                 </div>
               )
@@ -229,14 +340,14 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
         <div className="absolute right-3 bottom-3 flex flex-col gap-1.5 z-10">
           <button
             onClick={scrollToTop}
-            className="w-7 h-7 rounded bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
+            className="w-8 h-8 rounded-md bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
             title="滚动到顶部"
           >
             <ChevronUpIcon />
           </button>
           <button
             onClick={scrollToBottom}
-            className="w-7 h-7 rounded bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
+            className="w-8 h-8 rounded-md bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
             title="滚动到底部"
           >
             <ChevronDownIcon />

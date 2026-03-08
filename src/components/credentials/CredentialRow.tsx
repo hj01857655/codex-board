@@ -1,5 +1,8 @@
+import { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useCredStore } from '@/store/credStore'
 import { deleteAuthFile, patchAuthFileStatus, testAuthFile } from '@/lib/management'
+import { autoDisableIfQuota } from '@/lib/autoDisable'
 import { formatRelativeTime, getProviderColor } from '@/utils/keyUtils'
 import { getEffectiveStatus } from '@/utils/statusUtils'
 import StatusBadge from './StatusBadge'
@@ -8,41 +11,92 @@ import type { AuthFile } from '@/types/api'
 interface CredentialRowProps {
   file: AuthFile
   isSelected: boolean
+  onToggleSelect?: (shiftKey: boolean) => void
 }
 
-export default function CredentialRow({ file, isSelected }: CredentialRowProps) {
+export default function CredentialRow({ file, isSelected, onToggleSelect }: CredentialRowProps) {
   const store = useCredStore.getState()
   const client = useCredStore((s) => s.client)
   const testResult = useCredStore((s) => s.testResults[file.name])
+  const [responseOpen, setResponseOpen] = useState(false)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const [rowBusy, setRowBusy] = useState<'testing' | 'toggle' | 'delete' | null>(null)
 
   const displayStatus = getEffectiveStatus(file, testResult)
+  const hasResponseBody = testResult?.responseJson !== undefined
+  const responseJsonText = useMemo(() => {
+    if (!responseOpen || testResult?.responseJson === undefined) return ''
+    try {
+      return JSON.stringify(testResult.responseJson, null, 2)
+    } catch {
+      return String(testResult.responseJson)
+    }
+  }, [responseOpen, testResult?.responseJson])
+
+  useEffect(() => {
+    if (!responseOpen) return
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        setResponseOpen(false)
+      }
+    }
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [responseOpen])
+
+  useEffect(() => {
+    if (!responseOpen) {
+      setCopyState('idle')
+    }
+  }, [responseOpen])
 
   async function handleTest() {
-    if (!client) return
-    store.setTestStatus(file.name, 'testing')
-    const result = await testAuthFile(client, file)
-    store.setTestResult(file.name, result)
+    if (!client || rowBusy) return
+    setRowBusy('testing')
+    try {
+      store.setTestStatus(file.name, 'testing')
+      const result = await testAuthFile(client, file)
+      store.setTestResult(file.name, result)
+      await autoDisableIfQuota(client, file, result, store.updateFile)
+    } finally {
+      setRowBusy(null)
+    }
   }
 
   async function handleToggleDisable() {
-    if (!client) return
+    if (!client || rowBusy) return
+    setRowBusy('toggle')
     const newDisabled = !file.disabled
     store.updateFile(file.name, { disabled: newDisabled, status: newDisabled ? 'disabled' : 'active' })
     try {
       await patchAuthFileStatus(client, file.name, newDisabled)
     } catch {
       store.updateFile(file.name, { disabled: file.disabled, status: file.status })
+    } finally {
+      setRowBusy(null)
     }
   }
 
   async function handleDelete() {
-    if (!client) return
+    if (!client || rowBusy) return
     if (!window.confirm(`确定要删除认证文件 "${file.name}"？此操作不可撤销。`)) return
-    store.removeFile(file.name)
+    setRowBusy('delete')
     try {
-      await deleteAuthFile(client, file.name)
-    } catch {
-      store.setFiles([...useCredStore.getState().files, file])
+      store.removeFile(file.name)
+      try {
+        await deleteAuthFile(client, file.name)
+      } catch {
+        store.setFiles([...useCredStore.getState().files, file])
+      }
+    } finally {
+      setRowBusy(null)
     }
   }
 
@@ -51,15 +105,107 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
   const availabilityColor = file.disabled ? '#9A948C' : '#10A37F'
   const availabilityTitle = file.disabled ? '已禁用' : '已启用'
   const quotaResetLabel = getQuotaResetLabel(testResult)
+  const rowSelectedClass = isSelected
+    ? 'bg-coral/10 ring-1 ring-inset ring-coral/35'
+    : 'hover:bg-surface/70'
+
+  function handleRowSelectToggle(e: React.MouseEvent<HTMLDivElement>) {
+    const target = e.target as HTMLElement
+    if (target.closest('button, a, input, textarea, select, [data-no-row-select]')) {
+      return
+    }
+    if (onToggleSelect) {
+      onToggleSelect(e.shiftKey)
+      return
+    }
+    store.toggleSelect(file.name)
+  }
+
+  function handleCheckboxToggle(e: React.ChangeEvent<HTMLInputElement>) {
+    const shiftKey = !!((e.nativeEvent as { shiftKey?: boolean } | undefined)?.shiftKey)
+    if (onToggleSelect) {
+      onToggleSelect(shiftKey)
+      return
+    }
+    store.toggleSelect(file.name)
+  }
+
+  async function handleCopyResponse() {
+    if (!responseJsonText) return
+    try {
+      await navigator.clipboard.writeText(responseJsonText)
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
+    window.setTimeout(() => setCopyState('idle'), 1500)
+  }
+
+  const responseModal = responseOpen && hasResponseBody && typeof document !== 'undefined'
+    ? createPortal(
+      <div
+        className="fixed inset-0 z-[90] bg-black/55 backdrop-blur-[1px] flex items-center justify-center p-4"
+        onClick={() => setResponseOpen(false)}
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`响应体详情 ${file.name}`}
+          className="w-[min(1024px,96vw)] max-h-[90vh] bg-canvas border border-border rounded-2xl shadow-2xl overflow-hidden"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-5 py-3 border-b border-border flex items-center justify-between bg-surface">
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-ink truncate">
+                响应体详情
+              </div>
+              <div className="text-xs text-subtle truncate mt-0.5">{file.name}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCopyResponse}
+                className="h-8 px-3 rounded-md border border-border bg-canvas text-xs font-medium text-ink hover:border-ink transition-colors"
+              >
+                {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制内容'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setResponseOpen(false)}
+                className="h-8 px-3 rounded-md border border-border bg-canvas text-xs font-medium text-ink hover:border-ink transition-colors"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+          <div className="px-5 py-2.5 border-b border-border text-sm text-subtle bg-canvas/80">
+            响应码：<span className="font-semibold text-ink tabular-nums">{typeof testResult?.statusCode === 'number' ? testResult.statusCode : '未知'}</span>
+          </div>
+          <div className="p-5 overflow-auto max-h-[68vh] bg-surface/45">
+            <pre className="text-sm leading-6 text-ink whitespace-pre-wrap break-all font-mono-key">
+              {responseJsonText}
+            </pre>
+          </div>
+        </div>
+      </div>,
+      document.body
+    )
+    : null
 
   return (
-    <div className="flex items-center hover:bg-surface/60 transition-colors group border-b border-border last:border-0">
-      <div className="pl-4 pr-2 py-3 w-10 flex-shrink-0">
+    <>
+    <div
+      className={`flex items-center transition-colors group border-b border-border last:border-0 cursor-pointer ${rowSelectedClass}`}
+      onClick={handleRowSelectToggle}
+    >
+      <div className="pl-4 pr-2 py-3 w-12 flex-shrink-0 flex items-center">
         <input
           type="checkbox"
           checked={isSelected}
-          onChange={() => store.toggleSelect(file.name)}
+          onClick={(e) => e.stopPropagation()}
+          onChange={handleCheckboxToggle}
           className="checkbox-ui"
+          aria-label={`选择 ${file.name}`}
         />
       </div>
 
@@ -73,7 +219,7 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
           <div className="min-w-0">
             <div className="text-sm text-ink font-medium leading-tight truncate">{file.name}</div>
             {file.email && (
-              <div className="text-2xs text-subtle mt-0.5 truncate">{file.email}</div>
+              <div className="text-xs text-subtle mt-0.5 truncate">{file.email}</div>
             )}
           </div>
         </div>
@@ -81,7 +227,7 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
 
       <div className="px-3 py-3 w-24 flex-shrink-0">
         <span
-          className="inline-block text-2xs font-medium px-1.5 py-0.5 rounded whitespace-nowrap"
+          className="inline-block text-xs font-semibold px-2 py-0.5 rounded whitespace-nowrap"
           style={{ backgroundColor: `${providerColor}18`, color: providerColor }}
         >
           {providerLabel}
@@ -91,6 +237,21 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
       <div className="px-3 py-3 w-56 flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <StatusBadge status={displayStatus} />
+          {typeof testResult?.statusCode === 'number' && (
+            <span className="text-[11px] font-medium px-1.5 py-0.5 rounded border border-border text-subtle bg-canvas tabular-nums">
+              HTTP {testResult.statusCode}
+            </span>
+          )}
+          {hasResponseBody && (
+            <button
+              type="button"
+              onClick={() => setResponseOpen(true)}
+              className="text-[11px] font-medium px-2 py-0.5 rounded border border-coral/50 text-coral bg-coral/12 hover:bg-coral/18 transition-colors"
+              title="查看响应体"
+            >
+              响应体
+            </button>
+          )}
           {testResult?.quota && (
             <QuotaBar usedPercent={testResult.quota.rate_limit.primary_window?.used_percent ?? 0} resetAfterSeconds={testResult.quota.rate_limit.primary_window?.reset_after_seconds} />
           )}
@@ -99,39 +260,50 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
           )}
         </div>
         {testResult?.message && !testResult.quota && !testResult.copilotQuota && (
-          <div className="text-2xs text-subtle mt-0.5 truncate" title={testResult.message}>
+          <div className="text-xs text-subtle mt-0.5 truncate" title={testResult.message}>
             {testResult.message}
           </div>
         )}
       </div>
 
-      <div className="px-3 py-3 w-28 flex-shrink-0 text-2xs text-subtle tabular-nums" title={quotaResetLabel.full}> 
+      <div className="px-3 py-3 w-28 flex-shrink-0 text-xs text-subtle tabular-nums" title={quotaResetLabel.full}> 
         {quotaResetLabel.short}
       </div>
 
-      <div className="px-3 py-3 w-24 flex-shrink-0 text-2xs text-subtle">
+      <div className="px-3 py-3 w-24 flex-shrink-0 text-xs text-subtle">
         {formatRelativeTime(file.last_refresh)}
       </div>
 
       <div className="px-3 pr-4 py-3 w-24 flex-shrink-0">
-        <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <ActionButton title="测试" onClick={handleTest}>
-            <PlayIcon />
+        <div className="flex items-center justify-end gap-1 opacity-100">
+          <ActionButton title="测试" onClick={handleTest} disabled={rowBusy !== null}>
+            {rowBusy === 'testing' ? <SpinIcon /> : <PlayIcon />}
           </ActionButton>
+
+          {file.disabled && (
+            <ActionButton
+              title="启用"
+              onClick={handleToggleDisable}
+              disabled={rowBusy !== null}
+            >
+              {rowBusy === 'toggle' ? <SpinIcon /> : <EnableIcon />}
+            </ActionButton>
+          )}
 
           <ActionButton
-            title={file.disabled ? '启用' : '禁用'}
-            onClick={handleToggleDisable}
+            title="删除"
+            onClick={handleDelete}
+            disabled={rowBusy !== null}
+            className="hover:text-[#B94040]"
           >
-            {file.disabled ? <EnableIcon /> : <DisableIcon />}
-          </ActionButton>
-
-          <ActionButton title="删除" onClick={handleDelete} className="hover:text-[#B94040]">
-            <TrashIcon />
+            {rowBusy === 'delete' ? <SpinIcon /> : <TrashIcon />}
           </ActionButton>
         </div>
       </div>
+
     </div>
+    {responseModal}
+    </>
   )
 }
 
@@ -173,19 +345,23 @@ function formatResetDate(date: Date): string {
 function ActionButton({
   title,
   onClick,
+  disabled = false,
   children,
   className = '',
 }: {
   title: string
   onClick: () => void
+  disabled?: boolean
   children: React.ReactNode
   className?: string
 }) {
   return (
     <button
+      data-no-row-select
       title={title}
       onClick={onClick}
-      className={`p-1.5 text-subtle hover:text-ink rounded transition-colors ${className}`}
+      disabled={disabled}
+      className={`h-7 w-7 inline-flex items-center justify-center rounded-md border border-border bg-canvas text-subtle hover:text-ink hover:border-ink disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${className}`}
     >
       {children}
     </button>
@@ -196,14 +372,6 @@ function PlayIcon() {
   return (
     <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
       <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
-    </svg>
-  )
-}
-
-function DisableIcon() {
-  return (
-    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
     </svg>
   )
 }
@@ -220,6 +388,15 @@ function TrashIcon() {
   return (
     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+    </svg>
+  )
+}
+
+function SpinIcon() {
+  return (
+    <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-30" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
     </svg>
   )
 }

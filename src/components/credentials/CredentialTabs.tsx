@@ -1,16 +1,38 @@
-import { useState, useMemo, useRef, useEffect } from 'react'
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { useConnection } from '@/hooks/useConnection'
-import { useBatchTest } from '@/hooks/useBatchTest'
+import { useBatchTest, type BatchTestMode } from '@/hooks/useBatchTest'
 import { getProviderColor } from '@/utils/keyUtils'
 import { getEffectiveStatus, isExpiredStatus } from '@/utils/statusUtils'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
 import CredentialTable, { type SortMode } from './CredentialTable'
 import UploadModal from './UploadModal'
 import type { AuthFile } from '@/types/api'
-type QuickFilter = 'all' | 'expired' | 'quota' | 'has-quota' | 'other' | 'error' | 'can-disable' | 'can-enable'
+type QuickFilter = 'all' | 'expired' | 'quota' | 'has-quota' | 'disabled' | 'other' | 'error' | 'can-enable'
 const SORT_MODE_KEY = 'cliproxy_sort_mode'
+const PAGE_SIZE_KEY = 'cliproxy_page_size'
+const TEST_MODE_KEY = 'cliproxy_test_mode'
+const CONCURRENCY_OVERRIDE_KEY = 'cliproxy_concurrency_override'
+const DEFAULT_PAGE_SIZE = 200
+const VALID_PAGE_SIZES = [50, 100, 200, 500, 1000] as const
+type PageSize = (typeof VALID_PAGE_SIZES)[number]
+const VALID_TEST_MODES: BatchTestMode[] = ['untested', 'all', 'error', 'expired', 'quota']
+const VALID_CONCURRENCY_VALUES = [4, 6, 8, 10, 12, 16, 20] as const
+type ConcurrencyOverride = 'auto' | `${(typeof VALID_CONCURRENCY_VALUES)[number]}`
+const AUTO_REENABLE_SCAN_INTERVAL_MS = 90_000
+const AUTO_REENABLE_SCAN_COOLDOWN_MS = 90_000
+const AUTO_REENABLE_STALE_MS = 30 * 60 * 1000
+const AUTO_REENABLE_MAX_TARGETS = 300
+const BULK_ACTION_CONCURRENCY = 8
+const BULK_PROGRESS_UPDATE_INTERVAL_MS = 120
 
+type BulkSummary = { label: string; success: number; failed: number; detail?: string }
+type BulkOperationRunResult = { success: number; failed: number; total: number }
+type BulkOperationRunOptions = {
+  showSummary?: boolean
+  clearSelectionAfter?: boolean
+  closeMenu?: boolean
+}
 const VALID_SORT_MODES: SortMode[] = [
   'default', 'quota-first', 'status-first',
   'name-asc', 'name-desc',
@@ -29,21 +51,78 @@ function loadSortMode(): SortMode {
   return 'default'
 }
 
+function loadPageSize(): PageSize {
+  if (typeof window === 'undefined') return DEFAULT_PAGE_SIZE
+  const raw = window.localStorage.getItem(PAGE_SIZE_KEY)
+  const parsed = Number(raw)
+  if (Number.isFinite(parsed) && VALID_PAGE_SIZES.includes(parsed as PageSize)) {
+    return parsed as PageSize
+  }
+  return DEFAULT_PAGE_SIZE
+}
+
+function loadTestMode(): BatchTestMode {
+  if (typeof window === 'undefined') return 'untested'
+  const raw = window.localStorage.getItem(TEST_MODE_KEY)
+  if (raw && VALID_TEST_MODES.includes(raw as BatchTestMode)) {
+    return raw as BatchTestMode
+  }
+  return 'untested'
+}
+
+function loadConcurrencyOverride(): ConcurrencyOverride {
+  if (typeof window === 'undefined') return 'auto'
+  const raw = window.localStorage.getItem(CONCURRENCY_OVERRIDE_KEY)
+  if (!raw || raw === 'auto') return 'auto'
+  const parsed = Number(raw)
+  if (Number.isFinite(parsed) && VALID_CONCURRENCY_VALUES.includes(parsed as (typeof VALID_CONCURRENCY_VALUES)[number])) {
+    return String(parsed) as ConcurrencyOverride
+  }
+  return 'auto'
+}
+
 export default function CredentialTabs() {
   const [activeProvider, setActiveProvider] = useState<string>('全部')
   const [bulkMenuOpen, setBulkMenuOpen] = useState(false)
   const [bulkDisabling, setBulkDisabling] = useState(false)
+  const [bulkSummary, setBulkSummary] = useState<BulkSummary | null>(null)
   const [sortMode, setSortMode] = useState<SortMode>(() => loadSortMode())
   const [searchQuery, setSearchQuery] = useState('')
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all')
   const [bulkProgress, setBulkProgress] = useState<{ label: string; done: number; total: number } | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
+  const [pageSize, setPageSize] = useState<PageSize>(() => loadPageSize())
+  const [testMode, setTestMode] = useState<BatchTestMode>(() => loadTestMode())
+  const [concurrencyOverride, setConcurrencyOverride] = useState<ConcurrencyOverride>(() => loadConcurrencyOverride())
+  const [scanRunning, setScanRunning] = useState(false)
+  const [scanSummary, setScanSummary] = useState<string | null>(null)
+  const [pageJumpInput, setPageJumpInput] = useState('1')
   const menuRef = useRef<HTMLDivElement>(null)
+  const lastAutoScanAtRef = useRef(0)
 
   useEffect(() => {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(SORT_MODE_KEY, sortMode)
   }, [sortMode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(PAGE_SIZE_KEY, String(pageSize))
+  }, [pageSize])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(TEST_MODE_KEY, testMode)
+  }, [testMode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (concurrencyOverride === 'auto') {
+      window.localStorage.removeItem(CONCURRENCY_OVERRIDE_KEY)
+      return
+    }
+    window.localStorage.setItem(CONCURRENCY_OVERRIDE_KEY, concurrencyOverride)
+  }, [concurrencyOverride])
 
   useEffect(() => {
     if (!bulkMenuOpen) return
@@ -56,14 +135,27 @@ export default function CredentialTabs() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [bulkMenuOpen])
 
+  useEffect(() => {
+    if (!scanSummary) return
+    const timer = window.setTimeout(() => setScanSummary(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [scanSummary])
+
+  useEffect(() => {
+    if (!bulkSummary) return
+    const timer = window.setTimeout(() => setBulkSummary(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [bulkSummary])
+
   const files = useCredStore((s) => s.files)
   const testResults = useCredStore((s) => s.testResults)
   const client = useCredStore((s) => s.client)
   const loading = useCredStore((s) => s.loading)
   const refreshing = useCredStore((s) => s.refreshing)
-  const { updateFile, removeFile } = useCredStore.getState()
+  const { updateFile, removeFile, clearSelection } = useCredStore.getState()
   const { refresh } = useConnection()
-  const { testBatch, isRunning, progress } = useBatchTest()
+  const { testBatch, isRunning } = useBatchTest()
+  const [currentPage, setCurrentPage] = useState(1)
 
   const providers = useMemo(() => {
     const set = new Set(files.map((f) => f.provider || f.type || '未知'))
@@ -101,9 +193,7 @@ export default function CredentialTabs() {
     return 2
   }
 
-  function hasAvailableQuota(file: AuthFile): boolean {
-    const result = testResults[file.name]
-
+  function hasAvailableQuotaByResult(file: AuthFile, result: typeof testResults[string] | undefined): boolean {
     const codexRateLimit = result?.quota?.rate_limit
     if (codexRateLimit) {
       return codexRateLimit.allowed && !codexRateLimit.limit_reached
@@ -120,6 +210,10 @@ export default function CredentialTabs() {
 
     const status = getEffectiveStatus(file, result)
     return status === 'valid'
+  }
+
+  function hasAvailableQuota(file: AuthFile): boolean {
+    return hasAvailableQuotaByResult(file, testResults[file.name])
   }
 
   function getQuotaResetTimestamp(file: AuthFile): number | null {
@@ -161,6 +255,98 @@ export default function CredentialTabs() {
     return status === 'queued' || status === 'testing' || status === 'retrying'
   }
 
+  function pickReenableScanTargets(source: AuthFile[]): AuthFile[] {
+    const now = Date.now()
+    const candidates = source.filter((file) => {
+      if (!file.disabled) return false
+      if (isHiddenTestingStatus(file)) return false
+
+      const result = testResults[file.name]
+      const resetAt = getQuotaResetTimestamp(file)
+      if (resetAt !== null) {
+        return resetAt <= now
+      }
+      if (!result) return false
+      return now - result.testedAt >= AUTO_REENABLE_STALE_MS
+    })
+
+    candidates.sort((a, b) => {
+      const aReset = getQuotaResetTimestamp(a) ?? Number.POSITIVE_INFINITY
+      const bReset = getQuotaResetTimestamp(b) ?? Number.POSITIVE_INFINITY
+      if (aReset !== bReset) return aReset - bReset
+      const aTestedAt = testResults[a.name]?.testedAt ?? 0
+      const bTestedAt = testResults[b.name]?.testedAt ?? 0
+      return aTestedAt - bTestedAt
+    })
+
+    return candidates.slice(0, AUTO_REENABLE_MAX_TARGETS)
+  }
+
+  const runReenableScan = useCallback(async (reason: 'auto' | 'manual') => {
+    if (!client || isRunning || scanRunning || bulkDisabling) return
+
+    const now = Date.now()
+    if (reason === 'auto' && now - lastAutoScanAtRef.current < AUTO_REENABLE_SCAN_COOLDOWN_MS) {
+      return
+    }
+
+    const targets = pickReenableScanTargets(files)
+    if (targets.length === 0) {
+      if (reason === 'manual') {
+        setScanSummary('暂无需要扫描的已禁用项')
+      }
+      return
+    }
+
+    setScanRunning(true)
+    if (reason === 'manual') {
+      setScanSummary(`可启用扫描中：${targets.length} 项`)
+    }
+
+    try {
+      await testBatch(targets, { mode: 'all' })
+
+      const latestState = useCredStore.getState()
+      const latestMap = new Map(latestState.files.map((file) => [file.name, file] as const))
+      const canEnableTargets = targets
+        .map((file) => latestMap.get(file.name))
+        .filter((file): file is AuthFile => !!file)
+        .filter((file) => file.disabled && hasAvailableQuotaByResult(file, latestState.testResults[file.name]))
+
+      if (canEnableTargets.length === 0) {
+        if (reason === 'manual') {
+          setScanSummary('扫描完成：暂无可自动启用项')
+        }
+      } else {
+        const enableResult = await runBulkOperationInPool(
+          canEnableTargets,
+          reason === 'auto' ? '自动扫描：启用可用凭据' : '扫描后自动启用',
+          runEnableWorker,
+          { showSummary: false, clearSelectionAfter: false, closeMenu: false }
+        )
+        setScanSummary(
+          reason === 'auto'
+            ? `自动启用完成：成功 ${enableResult.success}，失败 ${enableResult.failed}`
+            : `扫描并自动启用完成：成功 ${enableResult.success}，失败 ${enableResult.failed}`
+        )
+      }
+
+      lastAutoScanAtRef.current = Date.now()
+    } finally {
+      setScanRunning(false)
+    }
+  }, [
+    bulkDisabling,
+    client,
+    files,
+    hasAvailableQuotaByResult,
+    isRunning,
+    runBulkOperationInPool,
+    runEnableWorker,
+    scanRunning,
+    testBatch,
+  ])
+
   const filesInProviderScope = useMemo(() => {
     const byProvider = activeProvider === '全部'
       ? files
@@ -183,11 +369,11 @@ export default function CredentialTabs() {
       if (quickFilter === 'expired') return isExpiredStatus(status)
       if (quickFilter === 'quota') return status === 'quota'
       if (quickFilter === 'has-quota') return hasAvailableQuota(f)
+      if (quickFilter === 'disabled') return status === 'disabled'
       if (quickFilter === 'error') return status === 'error'
       if (quickFilter === 'other') {
-        return !isExpiredStatus(status) && status !== 'quota' && status !== 'error' && !hasAvailableQuota(f)
+        return !f.disabled && !isExpiredStatus(status) && status !== 'quota' && status !== 'error' && !hasAvailableQuota(f)
       }
-      if (quickFilter === 'can-disable') return !f.disabled && status === 'quota'
       if (quickFilter === 'can-enable') return f.disabled && hasAvailableQuota(f)
       return true
     })
@@ -278,18 +464,20 @@ export default function CredentialTabs() {
     return list
   }, [filteredFiles, sortMode, testResults])
 
+  const totalPages = Math.max(1, Math.ceil(displayFiles.length / pageSize))
+  const pagedFiles = useMemo(() => {
+    const start = (currentPage - 1) * pageSize
+    return displayFiles.slice(start, start + pageSize)
+  }, [displayFiles, currentPage, pageSize])
+  const pageTokens = useMemo(
+    () => buildPageTokens(currentPage, totalPages),
+    [currentPage, totalPages]
+  )
+
   const expiredFiles = useMemo(
     () => displayFiles.filter((f) => {
       const s = getEffectiveStatus(f, testResults[f.name])
       return !f.disabled && isExpiredStatus(s)
-    }),
-    [displayFiles, testResults]
-  )
-
-  const quotaFiles = useMemo(
-    () => displayFiles.filter((f) => {
-      const s = getEffectiveStatus(f, testResults[f.name])
-      return !f.disabled && s === 'quota'
     }),
     [displayFiles, testResults]
   )
@@ -315,22 +503,17 @@ export default function CredentialTabs() {
   async function handleBulkRetest(targets: AuthFile[]) {
     if (targets.length === 0 || isRunning) return
     setBulkMenuOpen(false)
-    await testBatch(targets)
+    try {
+      await testBatch(targets, { mode: 'all' })
+    } finally {
+      clearSelection()
+    }
   }
 
   const reenableQuotaRecoveredFiles = useMemo(
     () => filesInProviderScope.filter((f) => {
       if (isHiddenTestingStatus(f)) return false
       return f.disabled && hasAvailableQuota(f)
-    }),
-    [filesInProviderScope, testResults]
-  )
-
-  const canDisableQuotaFiles = useMemo(
-    () => filesInProviderScope.filter((f) => {
-      if (isHiddenTestingStatus(f)) return false
-      const s = getEffectiveStatus(f, testResults[f.name])
-      return !f.disabled && s === 'quota'
     }),
     [filesInProviderScope, testResults]
   )
@@ -343,6 +526,15 @@ export default function CredentialTabs() {
     [filesInProviderScope, testResults]
   )
 
+  const allDisabledFiles = useMemo(
+    () => filesInProviderScope.filter((f) => {
+      if (isHiddenTestingStatus(f)) return false
+      const s = getEffectiveStatus(f, testResults[f.name])
+      return s === 'disabled'
+    }),
+    [filesInProviderScope, testResults]
+  )
+
   const allOtherFiles = useMemo(
     () => filesInProviderScope.filter((f) => {
       if (isHiddenTestingStatus(f)) return false
@@ -350,8 +542,9 @@ export default function CredentialTabs() {
       const isExpired = isExpiredStatus(s)
       const isQuota = s === 'quota'
       const isError = s === 'error'
+      const isDisabled = s === 'disabled'
       const isHasQuota = !f.disabled && hasAvailableQuota(f)
-      return !isExpired && !isQuota && !isError && !isHasQuota
+      return !isExpired && !isQuota && !isError && !isDisabled && !isHasQuota
     }),
     [filesInProviderScope, testResults]
   )
@@ -366,6 +559,14 @@ export default function CredentialTabs() {
   )
 
   useEffect(() => {
+    if (!client || isRunning || scanRunning) return
+    const timer = window.setTimeout(() => {
+      void runReenableScan('auto')
+    }, AUTO_REENABLE_SCAN_INTERVAL_MS)
+    return () => window.clearTimeout(timer)
+  }, [client, isRunning, runReenableScan, scanRunning])
+
+  useEffect(() => {
     if (isRunning) return
     if (quickFilter === 'all') return
 
@@ -373,9 +574,9 @@ export default function CredentialTabs() {
       expired: allExpiredFiles.length > 0,
       quota: allQuotaFiles.length > 0,
       'has-quota': allHasQuotaFiles.length > 0,
+      disabled: allDisabledFiles.length > 0,
       other: allOtherFiles.length > 0,
       error: allErrorFiles.length > 0,
-      'can-disable': canDisableQuotaFiles.length > 0,
       'can-enable': reenableQuotaRecoveredFiles.length > 0,
     }
 
@@ -388,29 +589,223 @@ export default function CredentialTabs() {
     allExpiredFiles.length,
     allQuotaFiles.length,
     allHasQuotaFiles.length,
+    allDisabledFiles.length,
     allOtherFiles.length,
     allErrorFiles.length,
-    canDisableQuotaFiles.length,
     reenableQuotaRecoveredFiles.length,
   ])
 
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
+
+  useEffect(() => {
+    setPageJumpInput(String(currentPage))
+  }, [currentPage])
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [activeProvider, quickFilter, searchQuery, sortMode, pageSize])
+
+  useEffect(() => {
+    clearSelection()
+  }, [activeProvider, quickFilter, searchQuery, sortMode, currentPage, pageSize, clearSelection])
+
+  async function handleTestCurrentCategory() {
+    if (isRunning || displayFiles.length === 0) return
+    try {
+      await testBatch(displayFiles, { mode: testMode })
+    } catch {
+    } finally {
+      clearSelection()
+    }
+  }
+
+  async function runBulkOperationInPool(
+    targets: AuthFile[],
+    label: string,
+    worker: (file: AuthFile) => Promise<boolean>,
+    options: BulkOperationRunOptions = {}
+  ): Promise<BulkOperationRunResult> {
+    if (targets.length === 0) {
+      return { success: 0, failed: 0, total: 0 }
+    }
+
+    const {
+      showSummary = true,
+      clearSelectionAfter = true,
+      closeMenu = true,
+    } = options
+
+    setBulkDisabling(true)
+    if (closeMenu) {
+      setBulkMenuOpen(false)
+    }
+    if (showSummary) {
+      setBulkSummary(null)
+    }
+    setBulkProgress({ label, done: 0, total: targets.length })
+
+    const total = targets.length
+    const poolSize = Math.min(BULK_ACTION_CONCURRENCY, total)
+    let index = 0
+    let done = 0
+    let success = 0
+    let failed = 0
+    let lastProgressAt = Date.now()
+
+    function pushProgress(force = false): void {
+      const now = Date.now()
+      if (!force && done < total && now - lastProgressAt < BULK_PROGRESS_UPDATE_INTERVAL_MS) {
+        return
+      }
+      setBulkProgress({ label, done, total })
+      lastProgressAt = now
+    }
+
+    async function runNext(): Promise<void> {
+      while (true) {
+        const current = index++
+        if (current >= total) return
+        const file = targets[current]
+        let ok = false
+        try {
+          ok = await worker(file)
+        } catch {
+        } finally {
+          if (ok) success += 1
+          else failed += 1
+          done += 1
+          pushProgress(false)
+        }
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: poolSize }, runNext))
+      pushProgress(true)
+      const result: BulkOperationRunResult = { success, failed, total }
+      if (showSummary) {
+        setBulkSummary({ label, success, failed })
+      }
+      return result
+    } finally {
+      if (clearSelectionAfter) {
+        clearSelection()
+      }
+      setBulkDisabling(false)
+      setBulkProgress(null)
+    }
+  }
+
+  async function runDisableWorker(file: AuthFile): Promise<boolean> {
+    if (!client) return false
+    updateFile(file.name, { disabled: true, status: 'disabled' })
+    try {
+      await patchAuthFileStatus(client, file.name, true)
+      return true
+    } catch {
+      updateFile(file.name, { disabled: file.disabled, status: file.status })
+      return false
+    }
+  }
+
+  async function runEnableWorker(file: AuthFile): Promise<boolean> {
+    if (!client) return false
+    updateFile(file.name, { disabled: false, status: 'active' })
+    try {
+      await patchAuthFileStatus(client, file.name, false)
+      return true
+    } catch {
+      updateFile(file.name, { disabled: file.disabled, status: file.status })
+      return false
+    }
+  }
+
+  function collectOneClickTargetsFromStore(): {
+    errorTargets: AuthFile[]
+    expiredTargets: AuthFile[]
+    canEnableTargets: AuthFile[]
+  } {
+    const latestState = useCredStore.getState()
+    const scopedFiles = activeProvider === '全部'
+      ? latestState.files
+      : latestState.files.filter((f) => (f.provider || f.type || '未知') === activeProvider)
+
+    const visibleFiles = scopedFiles.filter((file) => {
+      const status = getEffectiveStatus(file, latestState.testResults[file.name])
+      return status !== 'queued' && status !== 'testing' && status !== 'retrying'
+    })
+
+    const errorTargets = visibleFiles.filter((file) => {
+      const status = getEffectiveStatus(file, latestState.testResults[file.name])
+      return status === 'error'
+    })
+
+    const expiredTargets = visibleFiles.filter((file) => {
+      const status = getEffectiveStatus(file, latestState.testResults[file.name])
+      return !file.disabled && isExpiredStatus(status)
+    })
+
+    const canEnableTargets = visibleFiles.filter((file) => {
+      return file.disabled && hasAvailableQuotaByResult(file, latestState.testResults[file.name])
+    })
+
+    return { errorTargets, expiredTargets, canEnableTargets }
+  }
+
+  async function handleSmartOneClick() {
+    if (!client || bulkDisabling || isRunning) return
+
+    const initial = collectOneClickTargetsFromStore()
+    const totalCandidates = initial.errorTargets.length + initial.expiredTargets.length + initial.canEnableTargets.length
+
+    setBulkMenuOpen(false)
+    if (totalCandidates === 0) {
+      setBulkSummary({ label: '智能一键处理', success: 0, failed: 0, detail: '当前没有可处理项' })
+      return
+    }
+
+    setBulkSummary(null)
+
+    if (initial.errorTargets.length > 0) {
+      try {
+        await testBatch(initial.errorTargets, { mode: 'all' })
+      } catch {
+      }
+    }
+
+    const afterRetest = collectOneClickTargetsFromStore()
+    const disableResult = await runBulkOperationInPool(
+      afterRetest.expiredTargets,
+      '智能一键：禁用已过期',
+      runDisableWorker,
+      { showSummary: false, clearSelectionAfter: false, closeMenu: false }
+    )
+
+    const afterDisable = collectOneClickTargetsFromStore()
+    const enableResult = await runBulkOperationInPool(
+      afterDisable.canEnableTargets,
+      '智能一键：启用有配额',
+      runEnableWorker,
+      { showSummary: false, clearSelectionAfter: false, closeMenu: false }
+    )
+
+    clearSelection()
+
+    setBulkSummary({
+      label: '智能一键处理',
+      success: disableResult.success + enableResult.success,
+      failed: disableResult.failed + enableResult.failed,
+      detail: `重试错误 ${initial.errorTargets.length} 项，禁用成功 ${disableResult.success}/${disableResult.total}，启用成功 ${enableResult.success}/${enableResult.total}`,
+    })
+  }
+
   async function handleBulkDisable(targets: AuthFile[], label: string) {
     if (!client || targets.length === 0) return
-    setBulkDisabling(true)
-    setBulkMenuOpen(false)
-    setBulkProgress({ label, done: 0, total: targets.length })
-    for (let i = 0; i < targets.length; i++) {
-      const file = targets[i]
-      updateFile(file.name, { disabled: true, status: 'disabled' })
-      try {
-        await patchAuthFileStatus(client, file.name, true)
-      } catch {
-        updateFile(file.name, { disabled: file.disabled, status: file.status })
-      }
-      setBulkProgress({ label, done: i + 1, total: targets.length })
-    }
-    setBulkDisabling(false)
-    setBulkProgress(null)
+    await runBulkOperationInPool(targets, label, runDisableWorker)
   }
 
   async function handleBulkDeleteExpired(targets: AuthFile[]) {
@@ -418,53 +813,44 @@ export default function CredentialTabs() {
     const confirmed = window.confirm(`确定要删除 ${targets.length} 个已过期凭据？此操作不可撤销。`)
     if (!confirmed) return
 
-    setBulkDisabling(true)
-    setBulkMenuOpen(false)
-    setBulkProgress({ label: '删除已过期', done: 0, total: targets.length })
-
-    for (let i = 0; i < targets.length; i++) {
-      const file = targets[i]
+    await runBulkOperationInPool(targets, '删除已过期', async (file) => {
       try {
         await deleteAuthFile(client, file.name)
         removeFile(file.name)
+        return true
       } catch {
+        return false
       }
-      setBulkProgress({ label: '删除已过期', done: i + 1, total: targets.length })
-    }
-
-    setBulkDisabling(false)
-    setBulkProgress(null)
+    })
   }
 
   async function handleBulkEnable(targets: AuthFile[], label: string) {
     if (!client || targets.length === 0) return
-    setBulkDisabling(true)
-    setBulkMenuOpen(false)
-    setBulkProgress({ label, done: 0, total: targets.length })
-    for (let i = 0; i < targets.length; i++) {
-      const file = targets[i]
-      updateFile(file.name, { disabled: false, status: 'active' })
-      try {
-        await patchAuthFileStatus(client, file.name, false)
-      } catch {
-        updateFile(file.name, { disabled: file.disabled, status: file.status })
-      }
-      setBulkProgress({ label, done: i + 1, total: targets.length })
-    }
-    setBulkDisabling(false)
-    setBulkProgress(null)
+    await runBulkOperationInPool(targets, label, runEnableWorker)
   }
 
-  const progressLabel = bulkProgress?.label ?? '批量测试'
-  const progressDone = bulkProgress?.done ?? progress.done
-  const progressTotal = bulkProgress?.total ?? progress.total
-  const showProgress = (bulkProgress && bulkProgress.total > 0) || (isRunning && progress.total > 0)
+  function commitPageJump(): void {
+    const parsed = Number(pageJumpInput)
+    if (!Number.isFinite(parsed)) {
+      setPageJumpInput(String(currentPage))
+      return
+    }
+    const nextPage = Math.max(1, Math.min(totalPages, Math.floor(parsed)))
+    setCurrentPage(nextPage)
+    setPageJumpInput(String(nextPage))
+  }
+
+  const progressLabel = bulkProgress?.label ?? '批量操作'
+  const progressDone = bulkProgress?.done ?? 0
+  const progressTotal = bulkProgress?.total ?? 0
+  const showProgress = !!bulkProgress && bulkProgress.total > 0
   const progressPercent = progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0
+  const smartActionTotal = allErrorFiles.length + expiredFiles.length + reenableQuotaRecoveredFiles.length
 
   return (
     <div className="rounded-lg border border-border shadow-card overflow-hidden">
-      <div className="flex items-center justify-between border-b border-border bg-surface">
-        <div className="flex gap-0 overflow-x-auto no-scrollbar">
+      <div className="border-b border-border bg-surface">
+        <div className="flex gap-0 overflow-x-auto no-scrollbar px-1 sm:px-0">
           {providers.map((provider) => {
             const count = provider === '全部'
               ? files.length
@@ -486,7 +872,7 @@ export default function CredentialTabs() {
               >
                 {provider}
                 <span
-                  className="ml-2 rounded-full px-1.5 text-2xs"
+                  className="ml-2 rounded-full px-1.5 text-xs font-medium"
                   style={isActive
                     ? { backgroundColor: `${color ?? '#C96442'}18`, color: color ?? '#C96442' }
                     : { backgroundColor: '#E8E6E1', color: '#6B6560' }
@@ -499,19 +885,19 @@ export default function CredentialTabs() {
           })}
         </div>
 
-        <div className="flex items-center gap-2 pb-1 pl-4 flex-shrink-0">
+        <div className="flex flex-wrap items-center gap-2 py-2 px-3 sm:px-4 border-t border-border/70">
           <input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="搜索文件名 / 邮箱"
-            className="w-44 text-2xs text-ink bg-canvas border border-border rounded px-2.5 py-1.5 placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-coral"
+            className="w-full sm:w-56 lg:w-64 h-8 text-xs text-ink bg-canvas border border-border rounded-md px-2.5 placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-coral/35"
           />
 
           <select
             value={sortMode}
             onChange={(e) => setSortMode(e.target.value as SortMode)}
-            className="text-2xs text-subtle bg-canvas border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-coral sr-only"
+            className="text-xs text-subtle bg-canvas border border-border rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-coral/35 sr-only"
             title="排序方式"
             aria-hidden="true"
           >
@@ -522,7 +908,7 @@ export default function CredentialTabs() {
 
           <button
             onClick={() => setUploadOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium text-subtle dark:text-ink/85 rounded hover:bg-black/5 hover:text-ink transition-colors"
+            className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-border bg-canvas text-subtle rounded-md hover:text-ink hover:border-ink transition-colors"
             title="上传凭证文件"
           >
             <UploadIcon />
@@ -532,77 +918,107 @@ export default function CredentialTabs() {
           <button
             onClick={refresh}
             disabled={refreshing}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium text-subtle dark:text-ink/85 rounded hover:bg-black/5 hover:text-ink disabled:opacity-50 transition-colors"
+            className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-border bg-canvas text-subtle rounded-md hover:text-ink hover:border-ink disabled:opacity-50 transition-colors"
           >
             <RefreshIcon spinning={refreshing} />
             刷新
           </button>
 
           <button
-            onClick={() => testBatch(displayFiles)}
+            onClick={() => void handleTestCurrentCategory()}
             disabled={isRunning || displayFiles.length === 0}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium text-coral rounded hover:bg-coral/10 disabled:opacity-50 transition-colors"
+            className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-coral/45 bg-coral/10 text-coral rounded-md hover:bg-coral/15 disabled:opacity-50 transition-colors"
           >
             测试当前类别
           </button>
 
+          <select
+            value={testMode}
+            onChange={(e) => setTestMode(e.target.value as BatchTestMode)}
+            className="h-8 text-xs text-subtle bg-canvas border border-border rounded-md px-2.5 focus:outline-none focus:ring-2 focus:ring-coral/35"
+            title="测试范围"
+          >
+            <option value="untested">只测未测</option>
+            <option value="all">全部重测</option>
+            <option value="error">只测错误</option>
+            <option value="expired">只测过期</option>
+            <option value="quota">只测超额</option>
+          </select>
+
+          <button
+            onClick={() => void runReenableScan('manual')}
+            disabled={isRunning || scanRunning}
+            className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-[#BDD9C2] bg-[#EDF9F0] text-[#2D7A3F] rounded-md hover:bg-[#E2F4E7] disabled:opacity-50 transition-colors"
+            title="扫描已禁用账号并自动启用可用项"
+          >
+            {scanRunning ? '扫描中...' : '扫描并自动启用'}
+          </button>
+
           <div className="relative" ref={menuRef}>
-              <button
-                onClick={() => setBulkMenuOpen((v) => !v)}
-                disabled={bulkDisabling || (expiredFiles.length === 0 && quotaFiles.length === 0 && allErrorFiles.length === 0 && allExpiredFiles.length === 0 && reenableQuotaRecoveredFiles.length === 0)}
-                className="flex items-center gap-1 px-3 py-1.5 text-2xs font-medium text-subtle dark:text-ink/85 rounded hover:bg-black/5 hover:text-ink disabled:opacity-50 transition-colors"
-                title="一键处理"
-              >
+            <button
+              onClick={() => setBulkMenuOpen((v) => !v)}
+              disabled={bulkDisabling || isRunning || (expiredFiles.length === 0 && allErrorFiles.length === 0 && allExpiredFiles.length === 0 && reenableQuotaRecoveredFiles.length === 0)}
+              className="h-8 inline-flex items-center gap-1 px-3 text-xs font-semibold border border-border bg-canvas text-subtle rounded-md hover:text-ink hover:border-ink disabled:opacity-50 transition-colors"
+              title="一键处理"
+            >
               {bulkDisabling ? <SpinIcon /> : <BanIcon />}
               一键处理
               <ChevronIcon />
             </button>
 
             {bulkMenuOpen && (
-              <div className="absolute right-0 top-full mt-1 w-48 bg-canvas border border-border rounded shadow-card z-20">
+              <div className="absolute right-0 top-full mt-1 w-[272px] bg-canvas border border-border rounded-lg shadow-card z-20 overflow-hidden">
+                <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">推荐操作</div>
                 <button
-                  onClick={() => handleBulkDisable(expiredFiles, '禁用已过期')}
-                  disabled={expiredFiles.length === 0}
-                  className="w-full text-left px-3 py-2 text-2xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  onClick={() => void handleSmartOneClick()}
+                  disabled={smartActionTotal === 0 || isRunning || bulkDisabling}
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
-                  <span className="text-ink font-medium">禁用已过期</span>
-                  <span className="ml-1.5 text-subtle">({expiredFiles.length})</span>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-ink font-semibold">智能一键处理（推荐）</span>
+                    <span className="text-subtle tabular-nums">{smartActionTotal}</span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-subtle">
+                    重试错误 {allErrorFiles.length} → 禁用已过期 {expiredFiles.length} → 启用有配额 {reenableQuotaRecoveredFiles.length}
+                  </div>
                 </button>
+
                 <div className="border-t border-border" />
-                <button
-                  onClick={() => handleBulkDisable(quotaFiles, '禁用已超额')}
-                  disabled={quotaFiles.length === 0}
-                  className="w-full text-left px-3 py-2 text-2xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  <span className="text-ink font-medium">禁用已超额</span>
-                  <span className="ml-1.5 text-subtle">({quotaFiles.length})</span>
-                </button>
-                <div className="border-t border-border" />
+                <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">单项操作</div>
                 <button
                   onClick={() => void handleBulkRetest(allErrorFiles)}
                   disabled={allErrorFiles.length === 0 || isRunning}
-                  className="w-full text-left px-3 py-2 text-2xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   <span className="text-ink font-medium">重试错误</span>
                   <span className="ml-1.5 text-subtle">({allErrorFiles.length})</span>
                 </button>
-                <div className="border-t border-border" />
                 <button
-                  onClick={() => handleBulkDeleteExpired(allExpiredFiles)}
-                  disabled={allExpiredFiles.length === 0}
-                  className="w-full text-left px-3 py-2 text-2xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  onClick={() => handleBulkDisable(expiredFiles, '禁用已过期')}
+                  disabled={expiredFiles.length === 0}
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
-                  <span className="text-[#B94040] font-medium">删除全部过期</span>
-                  <span className="ml-1.5 text-subtle">({allExpiredFiles.length})</span>
+                  <span className="text-ink font-medium">禁用已过期</span>
+                  <span className="ml-1.5 text-subtle">({expiredFiles.length})</span>
                 </button>
-                <div className="border-t border-border" />
                 <button
                   onClick={() => handleBulkEnable(reenableQuotaRecoveredFiles, '启用有配额')}
                   disabled={reenableQuotaRecoveredFiles.length === 0}
-                  className="w-full text-left px-3 py-2 text-2xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   <span className="text-ink font-medium">启用有配额</span>
                   <span className="ml-1.5 text-subtle">({reenableQuotaRecoveredFiles.length})</span>
+                </button>
+
+                <div className="border-t border-border mt-1" />
+                <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-[#B94040] tracking-[0.04em] uppercase">危险操作</div>
+                <button
+                  onClick={() => handleBulkDeleteExpired(allExpiredFiles)}
+                  disabled={allExpiredFiles.length === 0}
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-[#FFF6F6] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <span className="text-[#B94040] font-medium">删除全部过期</span>
+                  <span className="ml-1.5 text-subtle">({allExpiredFiles.length})</span>
                 </button>
               </div>
             )}
@@ -612,7 +1028,7 @@ export default function CredentialTabs() {
 
       {showProgress && (
         <div className="px-4 py-2 border-b border-border bg-canvas">
-          <div className="flex items-center justify-between text-2xs text-subtle mb-1">
+          <div className="flex items-center justify-between text-xs text-subtle mb-1">
             <span>{progressLabel}</span>
             <span className="tabular-nums">{progressDone}/{progressTotal}</span>
           </div>
@@ -622,8 +1038,133 @@ export default function CredentialTabs() {
         </div>
       )}
 
+      {scanSummary && (
+        <div className="px-4 py-2 border-b border-border bg-[#F6FBF7] text-xs text-[#2D7A3F]">
+          {scanSummary}
+        </div>
+      )}
+
+      {bulkSummary && (
+        <div
+          className={`px-4 py-2 border-b border-border text-xs ${
+            bulkSummary.failed > 0 ? 'bg-[#FFF7ED] text-[#9A6B1E]' : 'bg-[#F6FBF7] text-[#2D7A3F]'
+          }`}
+        >
+          <div>{bulkSummary.label}完成：成功 {bulkSummary.success}，失败 {bulkSummary.failed}</div>
+          {bulkSummary.detail && (
+            <div className="mt-0.5 text-[11px] opacity-90">{bulkSummary.detail}</div>
+          )}
+        </div>
+      )}
+
+      <div className="px-4 py-2 border-b border-border bg-surface/65">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+            disabled={currentPage <= 1}
+            className="h-8 px-2.5 rounded-md border border-border bg-canvas text-xs text-ink/90 hover:border-ink hover:text-ink disabled:opacity-50 transition-colors"
+          >
+            上一页
+          </button>
+
+          {pageTokens.map((token, idx) =>
+            token.type === 'ellipsis' ? (
+              <span key={`ellipsis-${idx}`} className="px-1.5 text-xs text-subtle">
+                ...
+              </span>
+            ) : (
+              <button
+                key={token.page}
+                onClick={() => setCurrentPage(token.page)}
+                className={`h-8 min-w-8 px-2.5 rounded-md border text-xs tabular-nums transition-colors ${
+                  token.page === currentPage
+                    ? 'border-coral bg-coral text-white'
+                    : 'border-border bg-canvas text-ink/90 hover:border-ink hover:text-ink'
+                }`}
+              >
+                {token.page}
+              </button>
+            )
+          )}
+
+          <button
+            onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+            disabled={currentPage >= totalPages}
+            className="h-8 px-2.5 rounded-md border border-border bg-canvas text-xs text-ink/90 hover:border-ink hover:text-ink disabled:opacity-50 transition-colors"
+          >
+            下一页
+          </button>
+
+          <label className="ml-1 inline-flex items-center gap-1 text-xs text-subtle whitespace-nowrap">
+            <span>跳转</span>
+            <input
+              value={pageJumpInput}
+              onChange={(e) => {
+                const digitsOnly = e.target.value.replace(/\D/g, '')
+                setPageJumpInput(digitsOnly)
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  commitPageJump()
+                }
+              }}
+              onBlur={commitPageJump}
+              className="h-8 w-14 rounded-md border border-border bg-canvas px-2 text-xs text-ink focus:outline-none focus:ring-2 focus:ring-coral/35"
+              inputMode="numeric"
+            />
+            <span>页</span>
+          </label>
+
+          <label className="ml-2 inline-flex items-center gap-1 text-xs text-subtle whitespace-nowrap">
+            <span>每页</span>
+            <select
+              value={pageSize}
+              onChange={(e) => {
+                const next = Number(e.target.value)
+                if (VALID_PAGE_SIZES.includes(next as PageSize)) {
+                  setPageSize(next as PageSize)
+                }
+              }}
+              className="h-8 rounded-md border border-border bg-canvas px-2 text-xs text-ink focus:outline-none focus:ring-2 focus:ring-coral/35"
+            >
+              {VALID_PAGE_SIZES.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </select>
+            <span>条</span>
+          </label>
+
+          <label className="ml-1 inline-flex items-center gap-1 text-xs text-subtle whitespace-nowrap">
+            <span>并发</span>
+            <select
+              value={concurrencyOverride}
+              onChange={(e) => setConcurrencyOverride(e.target.value as ConcurrencyOverride)}
+              className="h-8 rounded-md border border-border bg-canvas px-2 text-xs text-ink focus:outline-none focus:ring-2 focus:ring-coral/35"
+              title="测试并发上限"
+            >
+              <option value="auto">自动</option>
+              {VALID_CONCURRENCY_VALUES.map((value) => (
+                <option key={value} value={String(value)}>
+                  {value}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <span className="ml-2 text-xs text-subtle whitespace-nowrap">
+            共 <span className="tabular-nums text-ink">{displayFiles.length}</span> 条，
+            <span className="tabular-nums text-ink"> {totalPages} </span>页，
+            每页 <span className="tabular-nums text-ink">{pageSize}</span> 条，
+            并发 <span className="tabular-nums text-ink">{concurrencyOverride === 'auto' ? '自动' : concurrencyOverride}</span>
+          </span>
+        </div>
+      </div>
+
       <div className="px-4 py-2 border-b border-border bg-canvas">
-        <div className="flex items-center gap-2 min-w-0 overflow-x-auto no-scrollbar">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
           <QuickFilterButton
             active={quickFilter === 'all'}
             onClick={() => setQuickFilter('all')}
@@ -650,18 +1191,18 @@ export default function CredentialTabs() {
               label={`有配额 (${allHasQuotaFiles.length})`}
             />
           )}
+          {allDisabledFiles.length > 0 && (
+            <QuickFilterButton
+              active={quickFilter === 'disabled'}
+              onClick={() => setQuickFilter('disabled')}
+              label={`已禁用 (${allDisabledFiles.length})`}
+            />
+          )}
           {allOtherFiles.length > 0 && (
             <QuickFilterButton
               active={quickFilter === 'other'}
               onClick={() => setQuickFilter('other')}
               label={`其他 (${allOtherFiles.length})`}
-            />
-          )}
-          {canDisableQuotaFiles.length > 0 && (
-            <QuickFilterButton
-              active={quickFilter === 'can-disable'}
-              onClick={() => setQuickFilter('can-disable')}
-              label={`可禁用 (${canDisableQuotaFiles.length})`}
             />
           )}
           {reenableQuotaRecoveredFiles.length > 0 && (
@@ -683,11 +1224,44 @@ export default function CredentialTabs() {
         </div>
       </div>
 
-      <CredentialTable files={displayFiles} loading={loading} sortMode={sortMode} onSortChange={setSortMode} />
+      <CredentialTable files={pagedFiles} loading={loading} sortMode={sortMode} onSortChange={setSortMode} />
 
       {uploadOpen && <UploadModal onClose={() => setUploadOpen(false)} />}
     </div>
   )
+}
+
+type PageToken = { type: 'page'; page: number } | { type: 'ellipsis' }
+
+function buildPageTokens(currentPage: number, totalPages: number): PageToken[] {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, i) => ({
+      type: 'page',
+      page: i + 1,
+    }))
+  }
+
+  const pages = new Set<number>([1, totalPages, currentPage - 1, currentPage, currentPage + 1])
+  if (currentPage <= 4) {
+    ;[2, 3, 4, 5].forEach((p) => pages.add(p))
+  }
+  if (currentPage >= totalPages - 3) {
+    ;[totalPages - 1, totalPages - 2, totalPages - 3, totalPages - 4].forEach((p) => pages.add(p))
+  }
+
+  const sorted = Array.from(pages)
+    .filter((p) => p >= 1 && p <= totalPages)
+    .sort((a, b) => a - b)
+
+  const tokens: PageToken[] = []
+  for (let i = 0; i < sorted.length; i++) {
+    const page = sorted[i]
+    if (i > 0 && page - sorted[i - 1] > 1) {
+      tokens.push({ type: 'ellipsis' })
+    }
+    tokens.push({ type: 'page', page })
+  }
+  return tokens
 }
 
 function QuickFilterButton({
@@ -706,7 +1280,7 @@ function QuickFilterButton({
   return (
     <button
       onClick={onClick}
-      className={`h-7 px-2.5 rounded text-2xs font-medium tracking-[0.01em] border whitespace-nowrap flex-shrink-0 transition-colors ${
+      className={`h-8 px-3 rounded-md text-xs font-semibold tracking-[0.01em] border whitespace-nowrap flex-shrink-0 transition-colors ${
         isDanger
           ? active
             ? 'border-[#D55353] text-[#B94040] bg-[#FCEAEA] dark:border-[#A34B4B] dark:text-[#FFD6D6] dark:bg-[#4A2424]'
@@ -771,3 +1345,5 @@ function ChevronIcon() {
     </svg>
   )
 }
+
+

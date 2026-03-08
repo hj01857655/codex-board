@@ -6,6 +6,7 @@ import Header from '@/components/layout/Header'
 import ConnectionPanel from '@/components/connection/ConnectionPanel'
 import CredentialTabs from '@/components/credentials/CredentialTabs'
 import BulkActionBar from '@/components/bulk/BulkActionBar'
+import BatchProgressPanel from '@/components/bulk/BatchProgressPanel'
 import UsagePanel from '@/components/usage/UsagePanel'
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
         </>
       )}
 
+      <BatchProgressPanel />
       <BulkActionBar />
     </Layout>
   )

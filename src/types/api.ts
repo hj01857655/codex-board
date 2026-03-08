@@ -91,6 +91,7 @@ export interface TestResult {
   testedAt: number
   quota?: CodexQuota
   copilotQuota?: CopilotQuota
+  responseJson?: unknown
 }
 
 export interface UsageStats {

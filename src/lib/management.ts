@@ -84,6 +84,33 @@ function isCloudflareChallenge(res: ApiCallResponse): boolean {
   return false
 }
 
+function parseResponseJson(res: ApiCallResponse): unknown | undefined {
+  const body = (res.body ?? '').trim()
+  if (!body) return undefined
+
+  const contentType = getHeaderValues(res.header, 'content-type').join(',').toLowerCase()
+  const looksLikeJson =
+    contentType.includes('application/json')
+    || body.startsWith('{')
+    || body.startsWith('[')
+
+  if (!looksLikeJson) return undefined
+
+  try {
+    return JSON.parse(body)
+  } catch {
+    return undefined
+  }
+}
+
+function responseMeta(res: ApiCallResponse): Pick<TestResult, 'statusCode' | 'responseJson'> {
+  const parsed = parseResponseJson(res)
+  if (parsed === undefined) {
+    return { statusCode: res.status_code }
+  }
+  return { statusCode: res.status_code, responseJson: parsed }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms)
@@ -192,7 +219,7 @@ async function testCodexFile(
     if (isCloudflareChallenge(res)) {
       return {
         status: 'error',
-        statusCode: res.status_code,
+        ...responseMeta(res),
         message: getChallengeBlockedMessage(initialAttempt.challengeRetries),
         testedAt: now,
       }
@@ -206,62 +233,87 @@ async function testCodexFile(
         if (isCloudflareChallenge(retry)) {
           return {
             status: 'error',
-            statusCode: retry.status_code,
+            ...responseMeta(retry),
             message: getChallengeBlockedMessage(retryAttempt.challengeRetries),
             testedAt: now,
           }
         }
 
         if (retry.status_code === 401 || retry.status_code === 403) {
-          return { status: 'expired', statusCode: retry.status_code, testedAt: now }
+          return { status: 'expired', ...responseMeta(retry), testedAt: now }
         }
         if (retry.status_code === 429) {
-          return { status: 'quota', statusCode: 429, testedAt: now }
+          return { status: 'quota', ...responseMeta(retry), testedAt: now }
         }
         if (retry.status_code !== 200) {
-          return { status: 'error', statusCode: retry.status_code, message: retry.body.slice(0, 120), testedAt: now }
+          return {
+            status: 'error',
+            ...responseMeta(retry),
+            message: retry.body.slice(0, 120),
+            testedAt: now,
+          }
         }
 
         let retryQuota: CodexQuota | undefined
         try {
           retryQuota = JSON.parse(retry.body) as CodexQuota
         } catch {
-          return { status: 'valid', statusCode: 200, testedAt: now }
+          return { status: 'valid', ...responseMeta(retry), testedAt: now }
         }
 
         const retryRateLimit = retryQuota.rate_limit
         if (!retryRateLimit.allowed || retryRateLimit.limit_reached) {
-          return { status: 'quota', statusCode: 200, testedAt: now, quota: retryQuota }
+          return {
+            status: 'quota',
+            ...responseMeta(retry),
+            testedAt: now,
+            quota: retryQuota,
+          }
         }
 
-        return { status: 'valid', statusCode: 200, testedAt: now, quota: retryQuota }
+        return {
+          status: 'valid',
+          ...responseMeta(retry),
+          testedAt: now,
+          quota: retryQuota,
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'retry failed'
-        return { status: 'error', statusCode: res.status_code, message: `auth retry failed: ${message}`, testedAt: now }
+        return {
+          status: 'error',
+          ...responseMeta(res),
+          message: `auth retry failed: ${message}`,
+          testedAt: now,
+        }
       }
     }
 
     if (res.status_code === 429) {
-      return { status: 'quota', statusCode: 429, testedAt: now }
+      return { status: 'quota', ...responseMeta(res), testedAt: now }
     }
 
     if (res.status_code !== 200) {
-      return { status: 'error', statusCode: res.status_code, message: res.body.slice(0, 120), testedAt: now }
+      return {
+        status: 'error',
+        ...responseMeta(res),
+        message: res.body.slice(0, 120),
+        testedAt: now,
+      }
     }
 
     let quota: CodexQuota | undefined
     try {
       quota = JSON.parse(res.body) as CodexQuota
     } catch {
-      return { status: 'valid', statusCode: 200, testedAt: now }
+      return { status: 'valid', ...responseMeta(res), testedAt: now }
     }
 
     const rl = quota.rate_limit
     if (!rl.allowed || rl.limit_reached) {
-      return { status: 'quota', statusCode: 200, testedAt: now, quota }
+      return { status: 'quota', ...responseMeta(res), testedAt: now, quota }
     }
 
-    return { status: 'valid', statusCode: 200, testedAt: now, quota }
+    return { status: 'valid', ...responseMeta(res), testedAt: now, quota }
   } catch (err) {
     const message = err instanceof Error ? err.message : '未知错误'
     return { status: 'error', message, testedAt: now }
@@ -289,15 +341,20 @@ async function testCopilotFile(
     })
 
     if (res.status_code === 401 || res.status_code === 403) {
-      return { status: 'expired', statusCode: res.status_code, testedAt: now }
+      return { status: 'expired', ...responseMeta(res), testedAt: now }
     }
 
     if (res.status_code === 429) {
-      return { status: 'quota', statusCode: 429, testedAt: now }
+      return { status: 'quota', ...responseMeta(res), testedAt: now }
     }
 
     if (res.status_code !== 200) {
-      return { status: 'error', statusCode: res.status_code, message: res.body.slice(0, 120), testedAt: now }
+      return {
+        status: 'error',
+        ...responseMeta(res),
+        message: res.body.slice(0, 120),
+        testedAt: now,
+      }
     }
 
     try {
@@ -319,12 +376,27 @@ async function testCopilotFile(
         const remaining = snap?.remaining ?? snap?.quota_remaining ?? 0
         const entitlement = snap?.entitlement ?? 0
         if (!snap?.unlimited && entitlement > 0 && remaining === 0) {
-          return { status: 'quota', statusCode: 200, testedAt: now, copilotQuota }
+          return {
+            status: 'quota',
+            ...responseMeta(quotaRes),
+            testedAt: now,
+            copilotQuota,
+          }
         }
-        return { status: 'valid', statusCode: 200, testedAt: now, copilotQuota }
+        return {
+          status: 'valid',
+          ...responseMeta(quotaRes),
+          testedAt: now,
+          copilotQuota,
+        }
       }
 
-      return { status: 'valid', statusCode: 200, testedAt: now, message: `quota ${quotaRes.status_code}: ${quotaRes.body.slice(0, 80)}` }
+      return {
+        status: 'valid',
+        ...responseMeta(quotaRes),
+        testedAt: now,
+        message: `quota ${quotaRes.status_code}: ${quotaRes.body.slice(0, 80)}`,
+      }
     } catch (e) {
       return { status: 'valid', statusCode: 200, testedAt: now, message: `quota err: ${e instanceof Error ? e.message : String(e)}` }
     }

@@ -206,3 +206,45 @@ If adding features, prioritize in this order:
 - don’t bypass `/api-call` token indirection in frontend
 - don’t introduce non-pnpm package workflows
 - don’t couple component-local state to cross-page business state when store already owns it
+
+---
+
+## 10) Editing Method Rule
+
+- Do not use patch-style editing workflows for this repository.
+- Do not use apply_patch for code changes in this repository.
+- Make changes by directly editing target files and writing final file content.
+- Keep all behavior changes fully implemented (no temporary patch-only fixes).
+
+
+---
+
+## 11) Execution & Delivery Rules
+
+### Mandatory Engineering Rules
+
+- Always fix root cause first; do not ship temporary workaround-only changes.
+- Do not use patch-style editing workflows or apply_patch; edit files directly.
+- For any non-trivial code change, run pnpm build before claiming completion.
+- Never claim "fixed" or "done" without executable evidence (command + key output).
+- Keep user-facing behavior transparent: do not hide effective limits behind settings.
+
+### Concurrency & Batch Rules
+
+- If a user chooses manual concurrency, do not silently downgrade it in hidden paths.
+- If auto mode applies safety limits, make the applied behavior observable in UI text/metrics.
+- For large batches, use bounded concurrency pool + streaming completion updates; avoid pure sequential loops unless dependency requires it.
+- Batch actions must provide progress and final success/failed summary.
+
+### UX Operability Rules
+
+- Selection UX must stay obvious: row click selectable, checkbox high-contrast, keyboard shortcuts available.
+- Modal/popup interactions must always be closable (close button, Esc, backdrop click when safe).
+- Do not regress readability for key controls (test/enable/disable/delete, pagination, filters).
+
+### State & Persistence Rules
+
+- Keep store state and persisted state consistent after updates, retries, and rollback paths.
+- Test results should persist per endpoint scope; do not rely on memory-only state for critical operator workflows.
+- After batch operations complete, clear selection by default unless explicit product requirement says otherwise.
+

@@ -5,13 +5,16 @@ import type { ConnectionConfig } from '@/types/api'
 
 export default function ConnectionPanel() {
   const canUseDevProxy = import.meta.env.DEV
+  const envEndpoint = (import.meta.env.VITE_ENDPOINT ?? '').trim()
+  const envManagementKey = (import.meta.env.VITE_MANAGEMENT_KEY ?? '').trim()
+  const envUseProxy = import.meta.env.VITE_PROXY_MODE === 'true'
   const connected = useCredStore((s) => s.connected)
   const connection = useCredStore((s) => s.connection)
   const { connect, disconnect, error, isConnecting } = useConnection()
 
-  const [endpoint, setEndpoint] = useState('')
-  const [managementKey, setManagementKey] = useState('')
-  const [useProxy, setUseProxy] = useState(false)
+  const [endpoint, setEndpoint] = useState(envEndpoint)
+  const [managementKey, setManagementKey] = useState(envManagementKey)
+  const [useProxy, setUseProxy] = useState(canUseDevProxy ? envUseProxy : false)
 
   useEffect(() => {
     if (connection) {
