@@ -1,24 +1,30 @@
-import { useRef, useState } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { testAuthFile } from '@/lib/management'
 import type { AuthFile } from '@/types/api'
 
 const CONCURRENCY = 20
+let cancelled = false
 
 export function useBatchTest() {
-  const [isRunning, setIsRunning] = useState(false)
-  const [progress, setProgress] = useState({ done: 0, total: 0 })
-  const cancelledRef = useRef(false)
-
-  const client = useCredStore((s) => s.client)
-  const { setTestStatus, setTestResult } = useCredStore.getState()
+  const isRunning = useCredStore((s) => s.batchTestRunning)
+  const progress = useCredStore((s) => s.batchTestProgress)
 
   async function testBatch(authFiles: AuthFile[]): Promise<void> {
-    if (!client || isRunning || authFiles.length === 0) return
+    const {
+      client,
+      batchTestRunning,
+      setTestStatus,
+      setTestResult,
+      setBatchTestRunning,
+      setBatchTestProgress,
+    } = useCredStore.getState()
 
-    cancelledRef.current = false
-    setIsRunning(true)
-    setProgress({ done: 0, total: authFiles.length })
+    if (!client || batchTestRunning || authFiles.length === 0) return
+    const apiClient = client
+
+    cancelled = false
+    setBatchTestRunning(true)
+    setBatchTestProgress({ done: 0, total: authFiles.length })
 
     authFiles.forEach((f) => setTestStatus(f.name, 'queued'))
 
@@ -26,28 +32,30 @@ export function useBatchTest() {
     let index = 0
 
     async function runNext(): Promise<void> {
-      while (index < authFiles.length && !cancelledRef.current) {
+      while (index < authFiles.length && !cancelled) {
         const current = index++
         const f = authFiles[current]
         try {
           setTestStatus(f.name, 'testing')
-          const result = await testAuthFile(client!, f)
+          const result = await testAuthFile(apiClient, f)
           setTestResult(f.name, result)
         } catch {
           setTestResult(f.name, { status: 'error', message: 'Unexpected error', testedAt: Date.now() })
         }
         done++
-        setProgress({ done, total: authFiles.length })
+        setBatchTestProgress({ done, total: authFiles.length })
       }
     }
 
-    await Promise.all(Array.from({ length: CONCURRENCY }, runNext))
-
-    setIsRunning(false)
+    try {
+      await Promise.all(Array.from({ length: CONCURRENCY }, runNext))
+    } finally {
+      setBatchTestRunning(false)
+    }
   }
 
   function cancel(): void {
-    cancelledRef.current = true
+    cancelled = true
   }
 
   return { testBatch, isRunning, progress, cancel }

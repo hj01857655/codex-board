@@ -63,7 +63,9 @@ export default function CredentialTabs() {
   const refreshing = useCredStore((s) => s.refreshing)
   const { updateFile, removeFile } = useCredStore.getState()
   const { refresh } = useConnection()
-  const { testBatch, isRunning, progress } = useBatchTest()
+  const { testBatch } = useBatchTest()
+  const isRunning = useCredStore((s) => s.batchTestRunning)
+  const progress = useCredStore((s) => s.batchTestProgress)
 
   const providers = useMemo(() => {
     const set = new Set(files.map((f) => f.provider || f.type || '未知'))

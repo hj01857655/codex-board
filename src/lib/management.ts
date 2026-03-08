@@ -44,7 +44,7 @@ export async function fetchUsage(client: ApiClient): Promise<UsageResponse> {
 
 interface ApiCallResponse {
   status_code: number
-  header: Record<string, string[]>
+  header?: Record<string, string[]>
   body: string
 }
 
@@ -53,7 +53,8 @@ const CODEX_USAGE_CHALLENGE_BASE_DELAY_MS = 1200
 const CODEX_USAGE_TRANSIENT_MAX_RETRIES = 3
 const CODEX_USAGE_TRANSIENT_BASE_DELAY_MS = 1200
 
-function getHeaderValues(headers: Record<string, string[]>, name: string): string[] {
+function getHeaderValues(headers: Record<string, string[]> | undefined, name: string): string[] {
+  if (!headers) return []
   const target = name.toLowerCase()
   for (const [key, values] of Object.entries(headers)) {
     if (key.toLowerCase() === target) return values
@@ -61,24 +62,87 @@ function getHeaderValues(headers: Record<string, string[]>, name: string): strin
   return []
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function getRecordValue(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = record[key]
+  return isPlainObject(value) ? value : undefined
+}
+
+function getBooleanValue(record: Record<string, unknown>, key: string): boolean | undefined {
+  const value = record[key]
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function hasCodexRateLimitShape(value: unknown): value is CodexQuota {
+  if (!isPlainObject(value)) return false
+  const rateLimit = getRecordValue(value, 'rate_limit')
+  if (!rateLimit) return false
+
+  const allowed = getBooleanValue(rateLimit, 'allowed')
+  const limitReached = getBooleanValue(rateLimit, 'limit_reached')
+
+  return typeof allowed === 'boolean' && typeof limitReached === 'boolean'
+}
+
+function parseCodexQuotaFromBody(body: string): CodexQuota | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body)
+    if (hasCodexRateLimitShape(parsed)) {
+      return parsed
+    }
+
+    if (isPlainObject(parsed)) {
+      const candidates = [
+        parsed.response,
+        parsed.data,
+        parsed.result,
+        parsed.quota,
+      ]
+
+      for (const candidate of candidates) {
+        if (hasCodexRateLimitShape(candidate)) {
+          return candidate
+        }
+      }
+    }
+
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+function createCodexSessionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
 function isCloudflareChallenge(res: ApiCallResponse): boolean {
   const cfMitigated = getHeaderValues(res.header, 'cf-mitigated').join(',').toLowerCase()
   if (cfMitigated.includes('challenge')) return true
 
   const setCookie = getHeaderValues(res.header, 'set-cookie').join(',').toLowerCase()
-  if (setCookie.includes('__cf_bm=') || setCookie.includes('cf_clearance=')) {
-    if (res.status_code === 403 || res.status_code === 429 || res.status_code === 503) {
-      return true
-    }
-  }
-
   const contentType = getHeaderValues(res.header, 'content-type').join(',').toLowerCase()
   const body = res.body.toLowerCase()
+  const hasChallengeCookie = setCookie.includes('__cf_bm=') || setCookie.includes('cf_clearance=')
+  const hasChallengeMarker = body.includes('just a moment') || body.includes('/cdn-cgi/challenge-platform') || body.includes('_cf_chl_opt')
 
-  if (contentType.includes('text/html')) {
-    if (body.includes('just a moment') || body.includes('/cdn-cgi/challenge-platform') || body.includes('_cf_chl_opt')) {
-      return true
-    }
+  if (contentType.includes('text/html') && hasChallengeMarker) {
+    return true
+  }
+
+  if (hasChallengeCookie && (res.status_code === 403 || res.status_code === 503)) {
+    return true
+  }
+
+  if (res.status_code === 429 && contentType.includes('text/html') && hasChallengeMarker) {
+    return true
   }
 
   return false
@@ -116,17 +180,21 @@ function isRetryableCodexUsageError(err: unknown): boolean {
 }
 
 async function requestCodexUsage(client: ApiClient, authFile: AuthFile): Promise<ApiCallResponse> {
+  const header: Record<string, string> = {
+    Authorization: 'Bearer $TOKEN$',
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    'User-Agent': 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464',
+    Version: '0.101.0',
+    Session_id: createCodexSessionId(),
+    Originator: 'codex_cli_rs',
+  }
+
   return client.post<ApiCallResponse>('/api-call', {
     auth_index: authFile.auth_index,
     method: 'GET',
     url: 'https://chatgpt.com/backend-api/codex/usage',
-    header: {
-      Authorization: 'Bearer $TOKEN$',
-      'Content-Type': 'application/json',
-      'User-Agent': 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464',
-      Version: '0.101.0',
-      Originator: 'codex_cli_rs',
-    },
+    header,
   })
 }
 
@@ -222,10 +290,8 @@ async function testCodexFile(
           return { status: 'error', statusCode: retry.status_code, message: retry.body.slice(0, 120), testedAt: now }
         }
 
-        let retryQuota: CodexQuota | undefined
-        try {
-          retryQuota = JSON.parse(retry.body) as CodexQuota
-        } catch {
+        const retryQuota = parseCodexQuotaFromBody(retry.body)
+        if (!retryQuota) {
           return { status: 'valid', statusCode: 200, testedAt: now }
         }
 
@@ -249,10 +315,8 @@ async function testCodexFile(
       return { status: 'error', statusCode: res.status_code, message: res.body.slice(0, 120), testedAt: now }
     }
 
-    let quota: CodexQuota | undefined
-    try {
-      quota = JSON.parse(res.body) as CodexQuota
-    } catch {
+    const quota = parseCodexQuotaFromBody(res.body)
+    if (!quota) {
       return { status: 'valid', statusCode: 200, testedAt: now }
     }
 

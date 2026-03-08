@@ -12,6 +12,9 @@ interface CredStore {
   loading: boolean
   refreshing: boolean
 
+  batchTestRunning: boolean
+  batchTestProgress: { done: number; total: number }
+
   testResults: Record<string, TestResult>
 
   selected: Set<string>
@@ -28,6 +31,8 @@ interface CredStore {
   clearSelection: () => void
   setLoading: (v: boolean) => void
   setRefreshing: (v: boolean) => void
+  setBatchTestRunning: (v: boolean) => void
+  setBatchTestProgress: (progress: { done: number; total: number }) => void
 }
 
 export const useCredStore = create<CredStore>((set) => ({
@@ -38,6 +43,9 @@ export const useCredStore = create<CredStore>((set) => ({
   files: [],
   loading: false,
   refreshing: false,
+
+  batchTestRunning: false,
+  batchTestProgress: { done: 0, total: 0 },
 
   testResults: {},
   selected: new Set<string>(),
@@ -123,4 +131,8 @@ export const useCredStore = create<CredStore>((set) => ({
   setLoading: (v) => set({ loading: v }),
 
   setRefreshing: (v) => set({ refreshing: v }),
+
+  setBatchTestRunning: (v) => set({ batchTestRunning: v }),
+
+  setBatchTestProgress: (progress) => set({ batchTestProgress: progress }),
 }))
