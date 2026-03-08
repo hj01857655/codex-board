@@ -12,6 +12,7 @@ export default function BulkActionBar() {
   const selected = useCredStore((s) => s.selected)
   const files = useCredStore((s) => s.files)
   const client = useCredStore((s) => s.client)
+  const testResults = useCredStore((s) => s.testResults)
   const { clearSelection, removeFile, updateFile } = useCredStore.getState()
   const { testBatch, isRunning } = useBatchTest()
 
@@ -25,23 +26,28 @@ export default function BulkActionBar() {
     [files, selected]
   )
 
+  const hasActiveTesting = useMemo(
+    () => Object.values(testResults).some((result) => result?.status === 'queued' || result?.status === 'testing' || result?.status === 'retrying'),
+    [testResults]
+  )
+
   const count = selectedFiles.length
-  const actionDisabled = isRunning || busyAction !== null
+  const actionDisabled = isRunning || busyAction !== null || hasActiveTesting
 
   const subtitle = useMemo(() => {
-    if (isRunning) return '批量测试运行中'
+    if (isRunning || hasActiveTesting) return '测试运行中'
     if (busyText) return busyText
     if (lastSummary) return lastSummary
     return '先测试，再按结果启用/禁用/删除'
-  }, [isRunning, busyText, lastSummary])
+  }, [isRunning, hasActiveTesting, busyText, lastSummary])
 
   const subtitleTone = useMemo(() => {
     if (busyText) return 'text-[#9A6B1E]'
     if (lastSummary?.includes('失败')) return 'text-[#B94040]'
     if (lastSummary) return 'text-[#2D7A3F]'
-    if (isRunning) return 'text-coral'
+    if (isRunning || hasActiveTesting) return 'text-coral'
     return 'text-subtle'
-  }, [busyText, isRunning, lastSummary])
+  }, [busyText, isRunning, hasActiveTesting, lastSummary])
 
   useEffect(() => {
     if (count === 0) {
@@ -53,10 +59,10 @@ export default function BulkActionBar() {
   }, [count])
 
   useEffect(() => {
-    if (busyAction || isRunning) {
+    if (busyAction || isRunning || hasActiveTesting) {
       setExpanded(true)
     }
-  }, [busyAction, isRunning])
+  }, [busyAction, isRunning, hasActiveTesting])
 
   async function runInPool<T>(
     items: T[],
@@ -103,7 +109,7 @@ export default function BulkActionBar() {
 
   if (count === 0) return null
 
-  const hiddenByBatchProgress = isRunning || busyAction === 'test'
+  const hiddenByBatchProgress = isRunning || busyAction === 'test' || hasActiveTesting
 
   async function handleBulkTest() {
     if (selectedFiles.length === 0 || actionDisabled) return
@@ -349,6 +355,7 @@ function ExpandIcon() {
     </svg>
   )
 }
+
 
 
 
