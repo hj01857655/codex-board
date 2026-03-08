@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { useConnection } from '@/hooks/useConnection'
 import Layout from '@/components/layout/Layout'
@@ -12,10 +12,13 @@ import UsagePanel from '@/components/usage/UsagePanel'
 export default function App() {
   const { reconnectFromStorage } = useConnection()
   const connected = useCredStore((s) => s.connected)
+  const bootstrappedRef = useRef(false)
 
   useEffect(() => {
-    reconnectFromStorage()
-  }, [])
+    if (bootstrappedRef.current) return
+    bootstrappedRef.current = true
+    void reconnectFromStorage()
+  }, [reconnectFromStorage])
 
   return (
     <Layout>

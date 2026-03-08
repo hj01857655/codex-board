@@ -1,8 +1,23 @@
 import { useRef, useState } from 'react'
+import { ApiError } from '@/lib/api'
 import { useCredStore } from '@/store/credStore'
 import { fetchAuthFiles } from '@/lib/management'
 import { saveConnection, clearConnection, loadConnection } from '@/lib/storage'
 import type { ConnectionConfig } from '@/types/api'
+
+const RECONNECT_FETCH_RETRY_MAX = 2
+const RECONNECT_RETRY_DELAY_MS = 400
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function shouldDisconnectOnReconnectError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false
+  return err.statusCode === 401 || err.statusCode === 403 || err.statusCode === 404
+}
 
 export function useConnection() {
   const [error, setError] = useState<string | null>(null)
@@ -29,6 +44,7 @@ export function useConnection() {
     if (!committedClient) {
       return false
     }
+
     const files = await fetchAuthFiles(committedClient)
     if (!isCurrentLoadRequest(requestId)) {
       return false
@@ -36,8 +52,26 @@ export function useConnection() {
     if (useCredStore.getState().client !== committedClient) {
       return false
     }
+
     setFiles(files)
     return true
+  }
+
+  async function loadFilesWithRetry(requestId: number, retryMax: number): Promise<boolean> {
+    for (let attempt = 0; attempt <= retryMax; attempt += 1) {
+      try {
+        return await loadFilesWithClientGuard(requestId)
+      } catch (err) {
+        if (!isCurrentLoadRequest(requestId)) {
+          return false
+        }
+        if (attempt >= retryMax) {
+          throw err
+        }
+        await wait(RECONNECT_RETRY_DELAY_MS * (attempt + 1))
+      }
+    }
+    return false
   }
 
   async function connect(config: ConnectionConfig): Promise<void> {
@@ -45,6 +79,7 @@ export function useConnection() {
       setError('Endpoint and management key are required.')
       return
     }
+
     setError(null)
     setIsConnecting(true)
     setLoading(true)
@@ -88,12 +123,19 @@ export function useConnection() {
     setIsConnecting(true)
     setLoading(true)
     const requestId = nextLoadRequestId()
+
     try {
       setConnection(saved)
-      await loadFilesWithClientGuard(requestId)
+      const committed = await loadFilesWithRetry(requestId, RECONNECT_FETCH_RETRY_MAX)
+      if (!committed) return
     } catch (err) {
       if (!isCurrentLoadRequest(requestId)) return
-      storeDisconnect()
+
+      if (shouldDisconnectOnReconnectError(err)) {
+        clearConnection()
+        storeDisconnect()
+      }
+
       const message = err instanceof Error ? err.message : 'Failed to reconnect from saved config'
       setError(message)
       console.error('[useConnection] reconnectFromStorage failed:', err)
