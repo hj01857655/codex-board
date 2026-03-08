@@ -11,38 +11,47 @@ interface CredentialRowProps {
 }
 
 export default function CredentialRow({ file, isSelected }: CredentialRowProps) {
-  const store = useCredStore.getState()
   const client = useCredStore((s) => s.client)
   const testResult = useCredStore((s) => s.testResults[file.name])
+  const toggleSelect = useCredStore((s) => s.toggleSelect)
+  const setTestStatus = useCredStore((s) => s.setTestStatus)
+  const setTestResult = useCredStore((s) => s.setTestResult)
+  const updateFile = useCredStore((s) => s.updateFile)
+  const removeFileOptimistic = useCredStore((s) => s.removeFileOptimistic)
+  const restoreRemovedFile = useCredStore((s) => s.restoreRemovedFile)
 
   const displayStatus = getEffectiveStatus(file, testResult)
 
   async function handleTest() {
     if (!client) return
-    store.setTestStatus(file.name, 'testing')
-    const result = await testAuthFile(client, file)
-    store.setTestResult(file.name, result)
+    setTestStatus(file.name, 'testing')
+    const result = await testAuthFile(client, file, (status) => {
+      setTestStatus(file.name, status)
+    })
+    setTestResult(file.name, result)
   }
 
   async function handleToggleDisable() {
     if (!client) return
     const newDisabled = !file.disabled
-    store.updateFile(file.name, { disabled: newDisabled, status: newDisabled ? 'disabled' : 'active' })
+    updateFile(file.name, { disabled: newDisabled, status: newDisabled ? 'disabled' : 'active' })
     try {
       await patchAuthFileStatus(client, file.name, newDisabled)
     } catch {
-      store.updateFile(file.name, { disabled: file.disabled, status: file.status })
+      updateFile(file.name, { disabled: file.disabled, status: file.status })
     }
   }
 
   async function handleDelete() {
     if (!client) return
     if (!window.confirm(`确定要删除认证文件 "${file.name}"？此操作不可撤销。`)) return
-    store.removeFile(file.name)
+    const snapshot = removeFileOptimistic(file.name)
+    if (!snapshot) return
+
     try {
       await deleteAuthFile(client, file.name)
     } catch {
-      store.setFiles([...useCredStore.getState().files, file])
+      restoreRemovedFile(snapshot)
     }
   }
 
@@ -58,8 +67,9 @@ export default function CredentialRow({ file, isSelected }: CredentialRowProps) 
         <input
           type="checkbox"
           checked={isSelected}
-          onChange={() => store.toggleSelect(file.name)}
+          onChange={() => toggleSelect(file.name)}
           className="checkbox-ui"
+          aria-label={`选择文件 ${file.name}`}
         />
       </div>
 
@@ -184,6 +194,7 @@ function ActionButton({
   return (
     <button
       title={title}
+      aria-label={title}
       onClick={onClick}
       className={`p-1.5 text-subtle hover:text-ink rounded transition-colors ${className}`}
     >

@@ -1,6 +1,5 @@
 import type { ApiClient } from './api'
-import type { AuthFile, AuthFilesResponse, CodexQuota, CopilotQuota, TestResult, UsageResponse } from '@/types/api'
-import { useCredStore } from '@/store/credStore'
+import type { AuthFile, AuthFilesResponse, CodexQuota, CopilotQuota, TestResult, TestStatus, UsageResponse } from '@/types/api'
 
 export async function uploadAuthFile(
   client: ApiClient,
@@ -200,18 +199,22 @@ async function requestCodexUsage(client: ApiClient, authFile: AuthFile): Promise
 
 async function requestCodexUsageWithChallengeRetry(
   client: ApiClient,
-  authFile: AuthFile
+  authFile: AuthFile,
+  onStatusUpdate?: (status: TestStatus) => void
 ): Promise<{ response: ApiCallResponse; challengeRetries: number; transientRetries: number }> {
-  const { setTestStatus } = useCredStore.getState()
   let challengeRetries = 0
   let transientRetries = 0
+
+  const markRetrying = () => {
+    onStatusUpdate?.('retrying')
+  }
 
   while (true) {
     try {
       const response = await requestCodexUsage(client, authFile)
 
       if (isCloudflareChallenge(response) && challengeRetries < CODEX_USAGE_CHALLENGE_MAX_RETRIES) {
-        setTestStatus(authFile.name, 'retrying')
+        markRetrying()
         await sleep(getCodexChallengeDelayMs(challengeRetries))
         challengeRetries += 1
         continue
@@ -227,7 +230,7 @@ async function requestCodexUsageWithChallengeRetry(
         throw err
       }
 
-      setTestStatus(authFile.name, 'retrying')
+      markRetrying()
       await sleep(getCodexTransientDelayMs(transientRetries))
       transientRetries += 1
     }
@@ -236,7 +239,8 @@ async function requestCodexUsageWithChallengeRetry(
 
 export async function testAuthFile(
   client: ApiClient,
-  authFile: AuthFile
+  authFile: AuthFile,
+  onStatusUpdate?: (status: TestStatus) => void
 ): Promise<TestResult> {
   const provider = (authFile.provider || authFile.type || '').toLowerCase()
 
@@ -244,17 +248,18 @@ export async function testAuthFile(
     return testCopilotFile(client, authFile)
   }
 
-  return testCodexFile(client, authFile)
+  return testCodexFile(client, authFile, onStatusUpdate)
 }
 
 async function testCodexFile(
   client: ApiClient,
-  authFile: AuthFile
+  authFile: AuthFile,
+  onStatusUpdate?: (status: TestStatus) => void
 ): Promise<TestResult> {
   const now = Date.now()
 
   try {
-    const initialAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
+    const initialAttempt = await requestCodexUsageWithChallengeRetry(client, authFile, onStatusUpdate)
     const res = initialAttempt.response
 
     if (isCloudflareChallenge(res)) {
@@ -268,7 +273,7 @@ async function testCodexFile(
 
     if (res.status_code === 401 || res.status_code === 403) {
       try {
-        const retryAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
+        const retryAttempt = await requestCodexUsageWithChallengeRetry(client, authFile, onStatusUpdate)
         const retry = retryAttempt.response
 
         if (isCloudflareChallenge(retry)) {

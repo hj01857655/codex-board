@@ -6,7 +6,10 @@ export default function BulkActionBar() {
   const selected = useCredStore((s) => s.selected)
   const files = useCredStore((s) => s.files)
   const client = useCredStore((s) => s.client)
-  const { clearSelection, removeFile, updateFile } = useCredStore.getState()
+  const clearSelection = useCredStore((s) => s.clearSelection)
+  const updateFile = useCredStore((s) => s.updateFile)
+  const removeFileOptimistic = useCredStore((s) => s.removeFileOptimistic)
+  const restoreRemovedFile = useCredStore((s) => s.restoreRemovedFile)
   const { testBatch, isRunning } = useBatchTest()
 
   if (selected.size === 0) return null
@@ -38,11 +41,12 @@ export default function BulkActionBar() {
     if (!window.confirm(`确定要删除选中的 ${count} 个认证文件？此操作不可撤销。`)) return
 
     for (const file of selectedFiles) {
-      removeFile(file.name)
+      const snapshot = removeFileOptimistic(file.name)
+      if (!snapshot) continue
       try {
         await deleteAuthFile(client, file.name)
       } catch {
-        useCredStore.getState().setFiles([...useCredStore.getState().files, file])
+        restoreRemovedFile(snapshot)
       }
     }
     clearSelection()
@@ -99,4 +103,3 @@ export default function BulkActionBar() {
     </div>
   )
 }
-

@@ -3,7 +3,6 @@ import { testAuthFile } from '@/lib/management'
 import type { AuthFile } from '@/types/api'
 
 const CONCURRENCY = 20
-let cancelled = false
 
 export function useBatchTest() {
   const isRunning = useCredStore((s) => s.batchTestRunning)
@@ -12,19 +11,23 @@ export function useBatchTest() {
   async function testBatch(authFiles: AuthFile[]): Promise<void> {
     const {
       client,
-      batchTestRunning,
       setTestStatus,
       setTestResult,
-      setBatchTestRunning,
+      startBatchTest,
+      finishBatchTest,
       setBatchTestProgress,
     } = useCredStore.getState()
 
-    if (!client || batchTestRunning || authFiles.length === 0) return
+    if (!client || authFiles.length === 0) return
     const apiClient = client
+    const runId = startBatchTest(authFiles.length)
+    if (runId === null) return
+    const activeRunId = runId
 
-    cancelled = false
-    setBatchTestRunning(true)
-    setBatchTestProgress({ done: 0, total: authFiles.length })
+    const shouldStop = () => {
+      const state = useCredStore.getState()
+      return !state.batchTestRunning || state.batchTestRunId !== activeRunId
+    }
 
     authFiles.forEach((f) => setTestStatus(f.name, 'queued'))
 
@@ -32,30 +35,40 @@ export function useBatchTest() {
     let index = 0
 
     async function runNext(): Promise<void> {
-      while (index < authFiles.length && !cancelled) {
+      while (index < authFiles.length && !shouldStop()) {
         const current = index++
         const f = authFiles[current]
         try {
           setTestStatus(f.name, 'testing')
-          const result = await testAuthFile(apiClient, f)
-          setTestResult(f.name, result)
+          const result = await testAuthFile(apiClient, f, (status) => {
+            if (!shouldStop()) {
+              setTestStatus(f.name, status)
+            }
+          })
+          if (!shouldStop()) {
+            setTestResult(f.name, result)
+          }
         } catch {
-          setTestResult(f.name, { status: 'error', message: 'Unexpected error', testedAt: Date.now() })
+          if (!shouldStop()) {
+            setTestResult(f.name, { status: 'error', message: 'Unexpected error', testedAt: Date.now() })
+          }
         }
         done++
-        setBatchTestProgress({ done, total: authFiles.length })
+        if (!shouldStop()) {
+          setBatchTestProgress(activeRunId, { done, total: authFiles.length })
+        }
       }
     }
 
     try {
       await Promise.all(Array.from({ length: CONCURRENCY }, runNext))
     } finally {
-      setBatchTestRunning(false)
+      finishBatchTest(activeRunId)
     }
   }
 
   function cancel(): void {
-    cancelled = true
+    useCredStore.getState().cancelBatchTest()
   }
 
   return { testBatch, isRunning, progress, cancel }

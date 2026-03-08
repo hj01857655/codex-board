@@ -62,7 +62,8 @@ function getDirection(mode: SortMode | undefined, col: SortCol): 'asc' | 'desc' 
 
 export default function CredentialTable({ files, loading, sortMode, onSortChange }: CredentialTableProps) {
   const selected = useCredStore((s) => s.selected)
-  const { selectAll, clearSelection } = useCredStore.getState()
+  const selectAll = useCredStore((s) => s.selectAll)
+  const clearSelection = useCredStore((s) => s.clearSelection)
 
   const allNames = files.map((f) => f.name)
   const allSelected = allNames.length > 0 && allNames.every((n) => selected.has(n))
@@ -130,6 +131,7 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
               }}
               onChange={(e) => handleSelectAll(e.target.checked)}
               className="checkbox-ui"
+              aria-label="选择当前列表所有文件"
             />
           </div>
 
@@ -179,6 +181,8 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
           ref={scrollRef}
           className="overflow-y-auto bg-canvas"
           style={{ height: 'calc(100vh - 280px)', minHeight: '300px' }}
+          role="region"
+          aria-label="认证文件列表"
         >
         {loading ? (
           <div>
@@ -231,6 +235,7 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
             onClick={scrollToTop}
             className="w-7 h-7 rounded bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
             title="滚动到顶部"
+            aria-label="滚动到顶部"
           >
             <ChevronUpIcon />
           </button>
@@ -238,6 +243,7 @@ export default function CredentialTable({ files, loading, sortMode, onSortChange
             onClick={scrollToBottom}
             className="w-7 h-7 rounded bg-canvas border border-border text-subtle hover:text-ink hover:border-ink transition-colors flex items-center justify-center"
             title="滚动到底部"
+            aria-label="滚动到底部"
           >
             <ChevronDownIcon />
           </button>
@@ -269,6 +275,8 @@ function SortHeader({ label, col, activeCol, direction, sortable, className = ''
         isActive ? 'text-ink' : ''
       }`}
       title={`按${label}排序`}
+      aria-label={`按${label}排序`}
+      aria-pressed={isActive}
     >
       <span>{label}</span>
       <SortIndicator active={isActive} direction={direction} />
