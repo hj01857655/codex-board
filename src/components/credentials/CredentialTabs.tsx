@@ -2,13 +2,19 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { useConnection } from '@/hooks/useConnection'
 import { useBatchTest, type BatchTestMode } from '@/hooks/useBatchTest'
+import { useBatchTestStore } from '@/store/batchTestStore'
 import { getProviderColor } from '@/utils/keyUtils'
 import { getEffectiveStatus, isExpiredStatus } from '@/utils/statusUtils'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
+import { runOperationInPool, type OperationPoolResult, type OperationProgressSnapshot } from '@/lib/operationOrchestrator'
+import { useTaskAuditStore, type TaskAuditStatus } from '@/store/taskAuditStore'
 import CredentialTable, { type SortMode } from './CredentialTable'
 import UploadModal from './UploadModal'
 import type { AuthFile } from '@/types/api'
+
+type TaskFinishedStatus = Exclude<TaskAuditStatus, 'running'>
 type QuickFilter = 'all' | 'expired' | 'quota' | 'has-quota' | 'disabled' | 'other' | 'error' | 'can-enable'
+type TestScope = 'page' | 'filtered' | 'provider'
 const SORT_MODE_KEY = 'cliproxy_sort_mode'
 const PAGE_SIZE_KEY = 'cliproxy_page_size'
 const TEST_MODE_KEY = 'cliproxy_test_mode'
@@ -19,19 +25,29 @@ type PageSize = (typeof VALID_PAGE_SIZES)[number]
 const VALID_TEST_MODES: BatchTestMode[] = ['untested', 'all', 'error', 'expired', 'quota']
 const VALID_CONCURRENCY_VALUES = [8, 12, 16, 20, 24, 32, 40, 48] as const
 type ConcurrencyOverride = 'auto' | `${(typeof VALID_CONCURRENCY_VALUES)[number]}`
-const AUTO_REENABLE_SCAN_INTERVAL_MS = 90_000
-const AUTO_REENABLE_SCAN_COOLDOWN_MS = 90_000
+const AUTO_SCAN_ENABLED_KEY = 'cliproxy_auto_scan_enabled'
 const AUTO_REENABLE_STALE_MS = 30 * 60 * 1000
 const AUTO_REENABLE_MAX_TARGETS = 300
+const AUTO_REENABLE_MIN_GAP_MS = 8_000
+const AUTO_SCAN_DUE_DELAY_MS = 5_000
+const AUTO_SCAN_MIN_DELAY_MS = 15_000
+const AUTO_SCAN_MAX_DELAY_MS = 5 * 60_000
+const AUTO_SCAN_IDLE_DELAY_MS = 90_000
+const AUTO_SCAN_BLOCKED_DELAY_MS = 20_000
+const LARGE_TEST_WARN_THRESHOLD = 1_000
+const LARGE_TEST_STRONG_CONFIRM_THRESHOLD = 5_000
 const BULK_ACTION_CONCURRENCY = 8
 const BULK_PROGRESS_UPDATE_INTERVAL_MS = 120
 
+type AutoScanReason = 'idle' | 'due' | 'scheduled' | 'blocked' | 'off'
 type BulkSummary = { label: string; success: number; failed: number; detail?: string }
-type BulkOperationRunResult = { success: number; failed: number; total: number }
+type BulkOperationRunResult = OperationPoolResult
+type BulkOperationProgress = Pick<OperationProgressSnapshot, 'done' | 'total' | 'success' | 'failed'>
 type BulkOperationRunOptions = {
   showSummary?: boolean
   clearSelectionAfter?: boolean
   closeMenu?: boolean
+  onProgress?: (progress: BulkOperationProgress) => void
 }
 const VALID_SORT_MODES: SortMode[] = [
   'default', 'quota-first', 'status-first',
@@ -81,6 +97,43 @@ function loadConcurrencyOverride(): ConcurrencyOverride {
   return 'auto'
 }
 
+function loadAutoScanEnabled(): boolean {
+  if (typeof window === 'undefined') return true
+  const raw = window.localStorage.getItem(AUTO_SCAN_ENABLED_KEY)
+  if (raw == null) return true
+  return raw !== '0' && raw.toLowerCase() !== 'false'
+}
+
+function formatClockTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false })
+}
+
+function resolveTaskOutcomeStatus(success: number, failed: number): TaskFinishedStatus {
+  if (failed <= 0) return 'success'
+  if (success > 0) return 'partial'
+  return 'failed'
+}
+
+function getTaskStatusText(status: TaskAuditStatus): string {
+  if (status === 'running') return '执行中'
+  if (status === 'success') return '成功'
+  if (status === 'partial') return '部分成功'
+  if (status === 'failed') return '失败'
+  return '已取消'
+}
+
+function getTaskStatusClass(status: TaskAuditStatus): string {
+  if (status === 'running') return 'bg-[#FFF7ED] text-[#9A6B1E]'
+  if (status === 'success') return 'bg-[#F6FBF7] text-[#2D7A3F]'
+  if (status === 'partial') return 'bg-[#FFF7ED] text-[#9A6B1E]'
+  if (status === 'failed') return 'bg-[#FFF0F0] text-[#B94040]'
+  return 'bg-[#F3F3F3] text-[#6B6560]'
+}
+
+function shortTaskId(taskId: string): string {
+  return taskId.length > 24 ? taskId.slice(0, 24) + '...' : taskId
+}
+
 export default function CredentialTabs() {
   const [activeProvider, setActiveProvider] = useState<string>('全部')
   const [bulkMenuOpen, setBulkMenuOpen] = useState(false)
@@ -93,9 +146,14 @@ export default function CredentialTabs() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [pageSize, setPageSize] = useState<PageSize>(() => loadPageSize())
   const [testMode, setTestMode] = useState<BatchTestMode>(() => loadTestMode())
+  const [testScope, setTestScope] = useState<TestScope>('filtered')
   const [concurrencyOverride, setConcurrencyOverride] = useState<ConcurrencyOverride>(() => loadConcurrencyOverride())
+  const [autoScanEnabled, setAutoScanEnabled] = useState<boolean>(() => loadAutoScanEnabled())
   const [scanRunning, setScanRunning] = useState(false)
   const [scanSummary, setScanSummary] = useState<string | null>(null)
+  const [autoScanNextAt, setAutoScanNextAt] = useState<number | null>(null)
+  const [autoScanDueCount, setAutoScanDueCount] = useState(0)
+  const [autoScanReason, setAutoScanReason] = useState<AutoScanReason>('idle')
   const [pageJumpInput, setPageJumpInput] = useState('1')
   const menuRef = useRef<HTMLDivElement>(null)
   const lastAutoScanAtRef = useRef(0)
@@ -123,6 +181,11 @@ export default function CredentialTabs() {
     }
     window.localStorage.setItem(CONCURRENCY_OVERRIDE_KEY, concurrencyOverride)
   }, [concurrencyOverride])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(AUTO_SCAN_ENABLED_KEY, autoScanEnabled ? '1' : '0')
+  }, [autoScanEnabled])
 
   useEffect(() => {
     if (!bulkMenuOpen) return
@@ -155,6 +218,7 @@ export default function CredentialTabs() {
   const { updateFile, removeFile, clearSelection } = useCredStore.getState()
   const { refresh } = useConnection()
   const { testBatch, isRunning } = useBatchTest()
+  const recentAuditTasks = useTaskAuditStore((s) => s.records.slice(0, 3))
   const [currentPage, setCurrentPage] = useState(1)
 
   const providers = useMemo(() => {
@@ -282,11 +346,60 @@ export default function CredentialTabs() {
     return candidates.slice(0, AUTO_REENABLE_MAX_TARGETS)
   }
 
+  function buildAutoReenableScanPlan(source: AuthFile[]): { delayMs: number; dueCount: number; reason: Exclude<AutoScanReason, 'off' | 'blocked'> } {
+    const now = Date.now()
+    let dueCount = 0
+    let minWaitMs = Number.POSITIVE_INFINITY
+    let hasDisabledCandidate = false
+
+    for (const file of source) {
+      if (!file.disabled) continue
+      if (isHiddenTestingStatus(file)) continue
+      hasDisabledCandidate = true
+
+      const resetAt = getQuotaResetTimestamp(file)
+      if (resetAt !== null) {
+        const waitMs = resetAt - now
+        if (waitMs <= 0) {
+          dueCount += 1
+        } else if (waitMs < minWaitMs) {
+          minWaitMs = waitMs
+        }
+        continue
+      }
+
+      const result = testResults[file.name]
+      if (!result) continue
+      const staleAt = result.testedAt + AUTO_REENABLE_STALE_MS
+      const waitMs = staleAt - now
+      if (waitMs <= 0) {
+        dueCount += 1
+      } else if (waitMs < minWaitMs) {
+        minWaitMs = waitMs
+      }
+    }
+
+    if (dueCount > 0) {
+      return { delayMs: AUTO_SCAN_DUE_DELAY_MS, dueCount, reason: 'due' }
+    }
+
+    if (Number.isFinite(minWaitMs)) {
+      const boundedDelay = Math.max(AUTO_SCAN_MIN_DELAY_MS, Math.min(AUTO_SCAN_MAX_DELAY_MS, Math.round(minWaitMs)))
+      return { delayMs: boundedDelay, dueCount: 0, reason: 'scheduled' }
+    }
+
+    return {
+      delayMs: AUTO_SCAN_IDLE_DELAY_MS,
+      dueCount: 0,
+      reason: hasDisabledCandidate ? 'scheduled' : 'idle',
+    }
+  }
+
   const runReenableScan = useCallback(async (reason: 'auto' | 'manual') => {
     if (!client || isRunning || scanRunning || bulkDisabling) return
 
     const now = Date.now()
-    if (reason === 'auto' && now - lastAutoScanAtRef.current < AUTO_REENABLE_SCAN_COOLDOWN_MS) {
+    if (reason === 'auto' && now - lastAutoScanAtRef.current < AUTO_REENABLE_MIN_GAP_MS) {
       return
     }
 
@@ -298,13 +411,25 @@ export default function CredentialTabs() {
       return
     }
 
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'scan',
+      source: reason === 'auto' ? 'auto' : 'manual',
+      label: reason === 'auto' ? '自动扫描可启用项' : '手动扫描可启用项',
+      scope: activeProvider === '全部' ? '全部' : activeProvider,
+      total: targets.length,
+    })
+
     setScanRunning(true)
     if (reason === 'manual') {
-      setScanSummary(`可启用扫描中：${targets.length} 项`)
+      setScanSummary('可启用扫描中：' + targets.length + ' 项')
     }
 
     try {
       await testBatch(targets, { mode: 'all' })
+
+      const scanSnapshot = useBatchTestStore.getState()
+      const scanFailed = scanSnapshot.stats.error + scanSnapshot.stats.other
+      const scanSuccess = Math.max(0, scanSnapshot.done - scanFailed)
 
       const latestState = useCredStore.getState()
       const latestMap = new Map(latestState.files.map((file) => [file.name, file] as const))
@@ -313,29 +438,62 @@ export default function CredentialTabs() {
         .filter((file): file is AuthFile => !!file)
         .filter((file) => file.disabled && hasAvailableQuotaByResult(file, latestState.testResults[file.name]))
 
-      if (canEnableTargets.length === 0) {
-        if (reason === 'manual') {
-          setScanSummary('扫描完成：暂无可自动启用项')
-        }
-      } else {
-        const enableResult = await runBulkOperationInPool(
+      let enableResult: BulkOperationRunResult = { success: 0, failed: 0, total: 0 }
+      if (canEnableTargets.length > 0) {
+        enableResult = await runBulkOperationInPool(
           canEnableTargets,
           reason === 'auto' ? '自动扫描：启用可用凭据' : '扫描后自动启用',
           runEnableWorker,
           { showSummary: false, clearSelectionAfter: false, closeMenu: false }
         )
+      }
+
+      const status: TaskFinishedStatus = scanSnapshot.wasCancelled
+        ? 'cancelled'
+        : enableResult.failed > 0
+          ? 'partial'
+          : resolveTaskOutcomeStatus(scanSuccess, scanFailed)
+
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status,
+        done: scanSnapshot.done,
+        success: scanSuccess,
+        failed: scanFailed,
+        detail:
+          '扫描完成：' + scanSnapshot.done + '/' + scanSnapshot.total +
+          '，自动启用成功 ' + enableResult.success +
+          '，失败 ' + enableResult.failed,
+      })
+
+      if (canEnableTargets.length === 0) {
+        if (reason === 'manual') {
+          setScanSummary('扫描完成：暂无可自动启用项')
+        }
+      } else {
         setScanSummary(
           reason === 'auto'
-            ? `自动启用完成：成功 ${enableResult.success}，失败 ${enableResult.failed}`
-            : `扫描并自动启用完成：成功 ${enableResult.success}，失败 ${enableResult.failed}`
+            ? '自动启用完成：成功 ' + enableResult.success + '，失败 ' + enableResult.failed
+            : '扫描并自动启用完成：成功 ' + enableResult.success + '，失败 ' + enableResult.failed
         )
       }
 
       lastAutoScanAtRef.current = Date.now()
+    } catch {
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'failed',
+        done: 0,
+        success: 0,
+        failed: targets.length,
+        detail: '扫描任务异常中断',
+      })
+      if (reason === 'manual') {
+        setScanSummary('扫描任务异常中断，请重试')
+      }
     } finally {
       setScanRunning(false)
     }
   }, [
+    activeProvider,
     bulkDisabling,
     client,
     files,
@@ -474,6 +632,25 @@ export default function CredentialTabs() {
     [currentPage, totalPages]
   )
 
+  const plannedTestTargets = useMemo(() => {
+    if (testScope === 'page') return pagedFiles
+    if (testScope === 'provider') return filesInProviderScope
+    return displayFiles
+  }, [displayFiles, filesInProviderScope, pagedFiles, testScope])
+
+  const testScopeLabel = useMemo(() => {
+    if (testScope === 'page') return '当前页'
+    if (testScope === 'provider') return '当前提供商'
+    return '当前筛选'
+  }, [testScope])
+
+  const testPlanText = useMemo(() => {
+    const modeText = testMode === 'all' ? '全部重测' : testMode === 'untested' ? '只测未测' : ''
+    return modeText
+      ? '计划 ' + testScopeLabel + ' ' + plannedTestTargets.length + ' 项 · ' + modeText
+      : '计划 ' + testScopeLabel + ' ' + plannedTestTargets.length + ' 项'
+  }, [plannedTestTargets.length, testMode, testScopeLabel])
+
   const expiredFiles = useMemo(
     () => displayFiles.filter((f) => {
       const s = getEffectiveStatus(f, testResults[f.name])
@@ -507,6 +684,7 @@ export default function CredentialTabs() {
       await testBatch(targets, { mode: 'all' })
     } finally {
       clearSelection()
+      triggerReenableScanAfterAction()
     }
   }
 
@@ -559,12 +737,35 @@ export default function CredentialTabs() {
   )
 
   useEffect(() => {
-    if (!client || isRunning || scanRunning) return
+    if (!autoScanEnabled || !client) {
+      setAutoScanNextAt(null)
+      setAutoScanDueCount(0)
+      setAutoScanReason(autoScanEnabled ? 'idle' : 'off')
+      return
+    }
+
+    if (isRunning || scanRunning || bulkDisabling) {
+      const delay = AUTO_SCAN_BLOCKED_DELAY_MS
+      setAutoScanDueCount(0)
+      setAutoScanReason('blocked')
+      setAutoScanNextAt(Date.now() + delay)
+      const timer = window.setTimeout(() => {
+        void runReenableScan('auto')
+      }, delay)
+      return () => window.clearTimeout(timer)
+    }
+
+    const plan = buildAutoReenableScanPlan(files)
+    const delay = Math.max(AUTO_SCAN_MIN_DELAY_MS, plan.delayMs)
+    setAutoScanDueCount(plan.dueCount)
+    setAutoScanReason(plan.reason)
+    setAutoScanNextAt(Date.now() + delay)
+
     const timer = window.setTimeout(() => {
       void runReenableScan('auto')
-    }, AUTO_REENABLE_SCAN_INTERVAL_MS)
+    }, delay)
     return () => window.clearTimeout(timer)
-  }, [client, isRunning, runReenableScan, scanRunning])
+  }, [autoScanEnabled, bulkDisabling, client, files, isRunning, runReenableScan, scanRunning, testResults])
 
   useEffect(() => {
     if (isRunning) return
@@ -613,13 +814,103 @@ export default function CredentialTabs() {
     clearSelection()
   }, [activeProvider, quickFilter, searchQuery, sortMode, currentPage, pageSize, clearSelection])
 
+  const triggerReenableScanAfterAction = useCallback(() => {
+    if (!client || !autoScanEnabled) return
+    // 事件触发扫描需要立即生效，不走轮询冷却窗口
+    lastAutoScanAtRef.current = 0
+    void runReenableScan('auto')
+  }, [autoScanEnabled, client, runReenableScan])
+
+  async function handleRefreshAndScan() {
+    if (refreshing) return
+    await refresh()
+    triggerReenableScanAfterAction()
+  }
+
   async function handleTestCurrentCategory() {
-    if (isRunning || displayFiles.length === 0) return
+    const targets = plannedTestTargets
+    if (isRunning || targets.length === 0) return
+
+    if (targets.length >= LARGE_TEST_STRONG_CONFIRM_THRESHOLD) {
+      const confirmText = window.prompt(
+        '本次将测试 ' + targets.length + ' 项（' + testScopeLabel + '），请输入 TEST 确认执行：'
+      )
+      if (confirmText?.trim().toUpperCase() !== 'TEST') return
+    } else if (targets.length >= LARGE_TEST_WARN_THRESHOLD) {
+      const confirmed = window.confirm(
+        '即将测试 ' + targets.length + ' 项（' + testScopeLabel + '）。该任务可能持续较久，是否继续？'
+      )
+      if (!confirmed) return
+    }
+
+    setBulkMenuOpen(false)
+    setBulkSummary(null)
+
+    const taskLabel = '测试任务（' + testScopeLabel + '）'
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'test',
+      source: 'manual',
+      label: taskLabel,
+      scope: testScopeLabel,
+      total: targets.length,
+    })
+
     try {
-      await testBatch(displayFiles, { mode: testMode })
+      await testBatch(targets, { mode: testMode })
+      const snapshot = useBatchTestStore.getState()
+      const stats = snapshot.stats
+      const success = stats.valid + stats.quota + stats.expired
+      const failed = stats.error + stats.other
+      const statusText = snapshot.wasCancelled ? '任务已取消' : '任务完成'
+      const status: TaskFinishedStatus = snapshot.wasCancelled
+        ? 'cancelled'
+        : resolveTaskOutcomeStatus(success, failed)
+
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status,
+        done: snapshot.done,
+        success,
+        failed,
+        detail:
+          statusText +
+          '：执行 ' + snapshot.done + '/' + snapshot.total +
+          '，有效 ' + stats.valid +
+          '，超额 ' + stats.quota +
+          '，过期 ' + stats.expired +
+          '，错误 ' + stats.error,
+      })
+
+      setBulkSummary({
+        label: taskLabel,
+        success,
+        failed,
+        detail:
+          statusText +
+          '：执行 ' + snapshot.done + '/' + snapshot.total +
+          '，有效 ' + stats.valid +
+          '，超额 ' + stats.quota +
+          '，过期 ' + stats.expired +
+          '，错误 ' + stats.error +
+          ' · 任务 ' + taskId,
+      })
     } catch {
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'failed',
+        done: 0,
+        success: 0,
+        failed: targets.length,
+        detail: '任务异常中断，请重试',
+      })
+
+      setBulkSummary({
+        label: taskLabel,
+        success: 0,
+        failed: 1,
+        detail: '任务异常中断，请重试 · 任务 ' + taskId,
+      })
     } finally {
       clearSelection()
+      triggerReenableScanAfterAction()
     }
   }
 
@@ -637,6 +928,7 @@ export default function CredentialTabs() {
       showSummary = true,
       clearSelectionAfter = true,
       closeMenu = true,
+      onProgress,
     } = options
 
     setBulkDisabling(true)
@@ -647,48 +939,27 @@ export default function CredentialTabs() {
       setBulkSummary(null)
     }
     setBulkProgress({ label, done: 0, total: targets.length })
-
-    const total = targets.length
-    const poolSize = Math.min(BULK_ACTION_CONCURRENCY, total)
-    let index = 0
-    let done = 0
-    let success = 0
-    let failed = 0
-    let lastProgressAt = Date.now()
-
-    function pushProgress(force = false): void {
-      const now = Date.now()
-      if (!force && done < total && now - lastProgressAt < BULK_PROGRESS_UPDATE_INTERVAL_MS) {
-        return
-      }
-      setBulkProgress({ label, done, total })
-      lastProgressAt = now
-    }
-
-    async function runNext(): Promise<void> {
-      while (true) {
-        const current = index++
-        if (current >= total) return
-        const file = targets[current]
-        let ok = false
-        try {
-          ok = await worker(file)
-        } catch {
-        } finally {
-          if (ok) success += 1
-          else failed += 1
-          done += 1
-          pushProgress(false)
-        }
-      }
-    }
+    onProgress?.({ done: 0, total: targets.length, success: 0, failed: 0 })
 
     try {
-      await Promise.all(Array.from({ length: poolSize }, runNext))
-      pushProgress(true)
-      const result: BulkOperationRunResult = { success, failed, total }
+      const result = await runOperationInPool({
+        items: targets,
+        maxConcurrency: BULK_ACTION_CONCURRENCY,
+        progressIntervalMs: BULK_PROGRESS_UPDATE_INTERVAL_MS,
+        worker,
+        onProgress: (snapshot) => {
+          setBulkProgress({ label, done: snapshot.done, total: snapshot.total })
+          onProgress?.({
+            done: snapshot.done,
+            total: snapshot.total,
+            success: snapshot.success,
+            failed: snapshot.failed,
+          })
+        },
+      })
+
       if (showSummary) {
-        setBulkSummary({ label, success, failed })
+        setBulkSummary({ label, success: result.success, failed: result.failed })
       }
       return result
     } finally {
@@ -763,17 +1034,37 @@ export default function CredentialTabs() {
     const totalCandidates = initial.errorTargets.length + initial.expiredTargets.length + initial.canEnableTargets.length
 
     setBulkMenuOpen(false)
+
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'smart',
+      source: 'manual',
+      label: '智能一键处理',
+      scope: activeProvider === '全部' ? '全部' : activeProvider,
+      total: totalCandidates,
+    })
+
     if (totalCandidates === 0) {
-      setBulkSummary({ label: '智能一键处理', success: 0, failed: 0, detail: '当前没有可处理项' })
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'success',
+        done: 0,
+        success: 0,
+        failed: 0,
+        detail: '当前没有可处理项',
+      })
+      setBulkSummary({ label: '智能一键处理', success: 0, failed: 0, detail: '当前没有可处理项 · 任务 ' + taskId })
       return
     }
 
     setBulkSummary(null)
 
+    let retestFailed = 0
     if (initial.errorTargets.length > 0) {
       try {
         await testBatch(initial.errorTargets, { mode: 'all' })
+        const snapshot = useBatchTestStore.getState()
+        retestFailed = snapshot.stats.error + snapshot.stats.other
       } catch {
+        retestFailed = initial.errorTargets.length
       }
     }
 
@@ -795,38 +1086,160 @@ export default function CredentialTabs() {
 
     clearSelection()
 
+    const retestSuccess = Math.max(0, initial.errorTargets.length - retestFailed)
+    const success = retestSuccess + disableResult.success + enableResult.success
+    const failed = retestFailed + disableResult.failed + enableResult.failed
+
+    useTaskAuditStore.getState().finishTask(taskId, {
+      status: resolveTaskOutcomeStatus(success, failed),
+      done: totalCandidates,
+      success,
+      failed,
+      detail:
+        '重试错误 ' + initial.errorTargets.length +
+        '（失败 ' + retestFailed + '），禁用成功 ' + disableResult.success + '/' + disableResult.total +
+        '，启用成功 ' + enableResult.success + '/' + enableResult.total,
+    })
+
     setBulkSummary({
       label: '智能一键处理',
-      success: disableResult.success + enableResult.success,
-      failed: disableResult.failed + enableResult.failed,
-      detail: `重试错误 ${initial.errorTargets.length} 项，禁用成功 ${disableResult.success}/${disableResult.total}，启用成功 ${enableResult.success}/${enableResult.total}`,
+      success,
+      failed,
+      detail:
+        '重试错误 ' + initial.errorTargets.length +
+        '（失败 ' + retestFailed + '），禁用成功 ' + disableResult.success + '/' + disableResult.total +
+        '，启用成功 ' + enableResult.success + '/' + enableResult.total +
+        ' · 任务 ' + taskId,
     })
   }
 
   async function handleBulkDisable(targets: AuthFile[], label: string) {
     if (!client || targets.length === 0) return
-    await runBulkOperationInPool(targets, label, runDisableWorker)
+
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'bulk',
+      source: 'manual',
+      label,
+      scope: activeProvider === '全部' ? '全部' : activeProvider,
+      total: targets.length,
+    })
+
+    try {
+      const result = await runBulkOperationInPool(targets, label, runDisableWorker, {
+        onProgress: (progress) => {
+          useTaskAuditStore.getState().updateTask(taskId, {
+            done: progress.done,
+            success: progress.success,
+            failed: progress.failed,
+          })
+        },
+      })
+
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: resolveTaskOutcomeStatus(result.success, result.failed),
+        done: result.total,
+        success: result.success,
+        failed: result.failed,
+      })
+    } catch {
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'failed',
+        done: 0,
+        success: 0,
+        failed: targets.length,
+        detail: label + '异常中断',
+      })
+    }
+
+    triggerReenableScanAfterAction()
   }
 
   async function handleBulkDeleteExpired(targets: AuthFile[]) {
     if (!client || targets.length === 0) return
-    const confirmed = window.confirm(`确定要删除 ${targets.length} 个已过期凭据？此操作不可撤销。`)
+    const confirmed = window.confirm('确定要删除 ' + targets.length + ' 个已过期凭据？此操作不可撤销。')
     if (!confirmed) return
 
-    await runBulkOperationInPool(targets, '删除已过期', async (file) => {
-      try {
-        await deleteAuthFile(client, file.name)
-        removeFile(file.name)
-        return true
-      } catch {
-        return false
-      }
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'bulk',
+      source: 'manual',
+      label: '删除已过期',
+      scope: activeProvider === '全部' ? '全部' : activeProvider,
+      total: targets.length,
     })
+
+    try {
+      const result = await runBulkOperationInPool(targets, '删除已过期', async (file) => {
+        try {
+          await deleteAuthFile(client, file.name)
+          removeFile(file.name)
+          return true
+        } catch {
+          return false
+        }
+      }, {
+        onProgress: (progress) => {
+          useTaskAuditStore.getState().updateTask(taskId, {
+            done: progress.done,
+            success: progress.success,
+            failed: progress.failed,
+          })
+        },
+      })
+
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: resolveTaskOutcomeStatus(result.success, result.failed),
+        done: result.total,
+        success: result.success,
+        failed: result.failed,
+      })
+    } catch {
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'failed',
+        done: 0,
+        success: 0,
+        failed: targets.length,
+        detail: '删除已过期异常中断',
+      })
+    }
   }
 
   async function handleBulkEnable(targets: AuthFile[], label: string) {
     if (!client || targets.length === 0) return
-    await runBulkOperationInPool(targets, label, runEnableWorker)
+
+    const taskId = useTaskAuditStore.getState().startTask({
+      type: 'bulk',
+      source: 'manual',
+      label,
+      scope: activeProvider === '全部' ? '全部' : activeProvider,
+      total: targets.length,
+    })
+
+    try {
+      const result = await runBulkOperationInPool(targets, label, runEnableWorker, {
+        onProgress: (progress) => {
+          useTaskAuditStore.getState().updateTask(taskId, {
+            done: progress.done,
+            success: progress.success,
+            failed: progress.failed,
+          })
+        },
+      })
+
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: resolveTaskOutcomeStatus(result.success, result.failed),
+        done: result.total,
+        success: result.success,
+        failed: result.failed,
+      })
+    } catch {
+      useTaskAuditStore.getState().finishTask(taskId, {
+        status: 'failed',
+        done: 0,
+        success: 0,
+        failed: targets.length,
+        detail: label + '异常中断',
+      })
+    }
   }
 
   function commitPageJump(): void {
@@ -845,6 +1258,19 @@ export default function CredentialTabs() {
   const progressTotal = bulkProgress?.total ?? 0
   const showProgress = !!bulkProgress && bulkProgress.total > 0
   const progressPercent = progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0
+  const autoScanReasonText = useMemo(() => {
+    if (autoScanReason === 'off') return '已关闭'
+    if (autoScanReason === 'blocked') return '等待批量任务空闲'
+    if (autoScanReason === 'due') return '有到期项待扫描'
+    if (autoScanReason === 'scheduled') return '按到期时间调度'
+    return '空闲巡检'
+  }, [autoScanReason])
+  const autoScanStatusText = useMemo(() => {
+    if (!autoScanEnabled) return '自动扫描：已关闭'
+    if (scanRunning) return '自动扫描：执行中'
+    const nextText = autoScanNextAt ? formatClockTime(autoScanNextAt) : '待定'
+    return '自动扫描：' + autoScanReasonText + ' · 下次 ' + nextText + ' · 候选 ' + autoScanDueCount
+  }, [autoScanDueCount, autoScanEnabled, autoScanNextAt, autoScanReasonText, scanRunning])
   const smartActionTotal = allErrorFiles.length + expiredFiles.length + reenableQuotaRecoveredFiles.length
 
   return (
@@ -916,7 +1342,7 @@ export default function CredentialTabs() {
           </button>
 
           <button
-            onClick={refresh}
+            onClick={() => void handleRefreshAndScan()}
             disabled={refreshing}
             className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-border bg-canvas text-subtle rounded-md hover:text-ink hover:border-ink disabled:opacity-50 transition-colors"
           >
@@ -924,12 +1350,23 @@ export default function CredentialTabs() {
             刷新
           </button>
 
+          <select
+            value={testScope}
+            onChange={(e) => setTestScope(e.target.value as TestScope)}
+            className="h-8 text-xs text-subtle bg-canvas border border-border rounded-md px-2.5 focus:outline-none focus:ring-2 focus:ring-coral/35"
+            title="测试目标范围"
+          >
+            <option value="page">当前页</option>
+            <option value="filtered">当前筛选</option>
+            <option value="provider">当前提供商</option>
+          </select>
+
           <button
             onClick={() => void handleTestCurrentCategory()}
-            disabled={isRunning || displayFiles.length === 0}
+            disabled={isRunning || plannedTestTargets.length === 0}
             className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-coral/45 bg-coral/10 text-coral rounded-md hover:bg-coral/15 disabled:opacity-50 transition-colors"
           >
-            测试当前类别
+            执行测试
           </button>
 
           <select
@@ -945,6 +1382,23 @@ export default function CredentialTabs() {
             <option value="quota">只测超额</option>
           </select>
 
+          <span className="text-xs text-subtle whitespace-nowrap">
+            {testPlanText}
+          </span>
+
+          <button
+            onClick={() => setAutoScanEnabled((v) => !v)}
+            className={
+              'h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border rounded-md transition-colors ' +
+              (autoScanEnabled
+                ? 'border-[#A9D9BF] bg-[#EEF9F2] text-[#2D7A3F] hover:bg-[#E5F5EB]'
+                : 'border-border bg-canvas text-subtle hover:text-ink hover:border-ink')
+            }
+            title={autoScanEnabled ? '关闭自动扫描' : '开启自动扫描'}
+          >
+            {autoScanEnabled ? '自动扫描:开' : '自动扫描:关'}
+          </button>
+
           <button
             onClick={() => void runReenableScan('manual')}
             disabled={isRunning || scanRunning}
@@ -953,6 +1407,10 @@ export default function CredentialTabs() {
           >
             {scanRunning ? '扫描中...' : '扫描并自动启用'}
           </button>
+
+          <span className="text-xs text-subtle whitespace-nowrap">
+            {autoScanStatusText}
+          </span>
 
           <div className="relative" ref={menuRef}>
             <button
@@ -1054,6 +1512,30 @@ export default function CredentialTabs() {
           {bulkSummary.detail && (
             <div className="mt-0.5 text-[11px] opacity-90">{bulkSummary.detail}</div>
           )}
+        </div>
+      )}
+
+      {recentAuditTasks.length > 0 && (
+        <div className="px-4 py-2 border-b border-border bg-canvas">
+          <div className="text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">最近任务审计</div>
+          <div className="mt-1.5 space-y-1">
+            {recentAuditTasks.map((task) => (
+              <div key={task.taskId} className="flex items-center justify-between gap-2 text-xs">
+                <div className="min-w-0">
+                  <div className="text-ink truncate">{task.label}</div>
+                  <div className="text-[11px] text-subtle truncate">
+                    {shortTaskId(task.taskId)} · {task.scope} · {task.source === 'auto' ? '自动' : '手动'} · {formatClockTime(task.startedAt)}
+                  </div>
+                </div>
+                <div className={`px-2 py-0.5 rounded-full text-[11px] whitespace-nowrap ${getTaskStatusClass(task.status)}`}>
+                  {getTaskStatusText(task.status)}
+                </div>
+                <div className="tabular-nums text-subtle whitespace-nowrap">
+                  {task.success}/{task.total}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -1345,6 +1827,11 @@ function ChevronIcon() {
     </svg>
   )
 }
+
+
+
+
+
 
 
 

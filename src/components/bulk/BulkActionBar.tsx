@@ -2,11 +2,36 @@ import { useEffect, useMemo, useState } from 'react'
 import { useCredStore } from '@/store/credStore'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
 import { useBatchTest } from '@/hooks/useBatchTest'
+import { runOperationInPool } from '@/lib/operationOrchestrator'
 
 type BusyAction = 'test' | 'enable' | 'disable' | 'delete' | null
 type BatchOutcome = { success: number; failed: number }
-const ACTION_CONCURRENCY = 8
+
+const ACTION_CONCURRENCY_DEFAULT = 8
+const ACTION_CONCURRENCY_STORAGE_KEY = 'cliproxy_concurrency_override'
 const PROGRESS_TEXT_UPDATE_INTERVAL_MS = 120
+
+function getManualActionConcurrencyOverride(): number | null {
+  if (typeof window === 'undefined') return null
+  const raw = window.localStorage.getItem(ACTION_CONCURRENCY_STORAGE_KEY)
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return Math.max(1, Math.min(96, Math.floor(parsed)))
+}
+
+function resolveActionConcurrency(total: number): number {
+  const manual = getManualActionConcurrencyOverride()
+  const base = manual ?? ACTION_CONCURRENCY_DEFAULT
+  if (total <= 0) return base
+  return Math.max(1, Math.min(base, total))
+}
+
+function summarizeFailedNames(names: string[]): string {
+  if (names.length === 0) return ''
+  const preview = names.slice(0, 3)
+  const rest = names.length - preview.length
+  return rest > 0 ? `（失败项示例：${preview.join('，')} 等 ${names.length} 项）` : `（失败项：${preview.join('，')}）`
+}
 
 export default function BulkActionBar() {
   const selected = useCredStore((s) => s.selected)
@@ -27,13 +52,15 @@ export default function BulkActionBar() {
 
   const count = selectedFiles.length
   const actionDisabled = isRunning || busyAction !== null
+  const actionConcurrency = useMemo(() => resolveActionConcurrency(count), [count])
 
   const subtitle = useMemo(() => {
     if (isRunning || busyAction === 'test') return '测试运行中'
     if (busyText) return busyText
     if (lastSummary) return lastSummary
-    return '先测试，再按结果启用/禁用/删除'
-  }, [isRunning, busyAction, busyText, lastSummary])
+    if (count === 0) return `先在列表勾选后再批量操作（并发 ${actionConcurrency}）`
+    return `先测试，再按结果启用/禁用/删除（并发 ${actionConcurrency}）`
+  }, [isRunning, busyAction, busyText, lastSummary, count, actionConcurrency])
 
   const subtitleTone = useMemo(() => {
     if (busyText) return 'text-[#9A6B1E]'
@@ -65,51 +92,28 @@ export default function BulkActionBar() {
   ): Promise<BatchOutcome> {
     if (items.length === 0) return { success: 0, failed: 0 }
 
-    const total = items.length
-    let index = 0
-    let done = 0
-    let success = 0
-    let lastProgressAt = Date.now()
-    const workerCount = Math.min(ACTION_CONCURRENCY, total)
+    let lastDone = -1
+    const outcome = await runOperationInPool({
+      items,
+      maxConcurrency: resolveActionConcurrency(items.length),
+      worker,
+      progressIntervalMs: PROGRESS_TEXT_UPDATE_INTERVAL_MS,
+      onProgress: (snapshot) => {
+        if (snapshot.done === lastDone) return
+        lastDone = snapshot.done
+        onProgress(snapshot.done, snapshot.total)
+      },
+    })
 
-    function pushProgress(force = false): void {
-      const now = Date.now()
-      if (!force && done < total && now - lastProgressAt < PROGRESS_TEXT_UPDATE_INTERVAL_MS) {
-        return
-      }
-      onProgress(done, total)
-      lastProgressAt = now
-    }
-
-    async function runNext(): Promise<void> {
-      while (true) {
-        const current = index++
-        if (current >= total) return
-        let ok = false
-        try {
-          ok = await worker(items[current], current)
-        } catch {
-        }
-        if (ok) success += 1
-        done += 1
-        pushProgress(false)
-      }
-    }
-
-    await Promise.all(Array.from({ length: workerCount }, runNext))
-    pushProgress(true)
-    return { success, failed: total - success }
+    return { success: outcome.success, failed: outcome.failed }
   }
-
   if (count === 0) return null
-
-  const hiddenByBatchProgress = isRunning || busyAction === 'test'
 
   async function handleBulkTest() {
     if (selectedFiles.length === 0 || actionDisabled) return
     setLastSummary(null)
     setBusyAction('test')
-    setBusyText('正在批量测试...')
+    setBusyText(`正在批量测试（并发 ${actionConcurrency}）...`)
     try {
       await testBatch(selectedFiles, { mode: 'all' })
       setLastSummary(`测试完成：共 ${selectedFiles.length} 项`)
@@ -127,6 +131,7 @@ export default function BulkActionBar() {
 
     setLastSummary(null)
     const actionLabel = disable ? '禁用' : '启用'
+    const failedNames: string[] = []
     setBusyAction(disable ? 'disable' : 'enable')
     try {
       const outcome = await runInPool(
@@ -140,13 +145,14 @@ export default function BulkActionBar() {
             await patchAuthFileStatus(client, file.name, disable)
             return true
           } catch {
+            failedNames.push(file.name)
             updateFile(file.name, { disabled: file.disabled, status: file.status })
             return false
           }
         },
-        (done, max) => setBusyText(`${actionLabel}中 ${done}/${max}`)
+        (done, max) => setBusyText(`${actionLabel}中 ${done}/${max}（并发 ${actionConcurrency}）`)
       )
-      setLastSummary(`${actionLabel}完成：成功 ${outcome.success}，失败 ${outcome.failed}`)
+      setLastSummary(`${actionLabel}完成：成功 ${outcome.success}，失败 ${outcome.failed}${summarizeFailedNames(failedNames)}`)
     } finally {
       clearSelection()
       setBusyAction(null)
@@ -159,6 +165,7 @@ export default function BulkActionBar() {
     if (!window.confirm(`确定要删除选中的 ${count} 个认证文件？此操作不可撤销。`)) return
 
     setLastSummary(null)
+    const failedNames: string[] = []
     setBusyAction('delete')
     try {
       const outcome = await runInPool(
@@ -169,12 +176,13 @@ export default function BulkActionBar() {
             removeFile(file.name)
             return true
           } catch {
+            failedNames.push(file.name)
             return false
           }
         },
-        (done, max) => setBusyText(`删除中 ${done}/${max}`)
+        (done, max) => setBusyText(`删除中 ${done}/${max}（并发 ${actionConcurrency}）`)
       )
-      setLastSummary(`删除完成：成功 ${outcome.success}，失败 ${outcome.failed}`)
+      setLastSummary(`删除完成：成功 ${outcome.success}，失败 ${outcome.failed}${summarizeFailedNames(failedNames)}`)
     } finally {
       clearSelection()
       setBusyAction(null)
@@ -186,7 +194,7 @@ export default function BulkActionBar() {
 
   return (
     <div
-      className={`fixed bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-2 sm:px-0 w-full sm:w-auto ${hiddenByBatchProgress ? 'hidden' : ''}`}
+      className="fixed bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-2 sm:px-0 w-full sm:w-auto"
       style={{ paddingBottom: 'max(0px, env(safe-area-inset-bottom))' }}
     >
       <div className="pointer-events-auto w-full sm:w-[min(96vw,880px)] rounded-2xl border border-border bg-canvas/96 backdrop-blur shadow-[0_16px_42px_rgba(26,26,26,0.24)] overflow-hidden">
@@ -199,6 +207,9 @@ export default function BulkActionBar() {
           <div className="flex items-center gap-2 flex-shrink-0">
             <div className="h-8 px-3 inline-flex items-center rounded-full border border-border bg-canvas text-xs tabular-nums text-ink">
               已选 {count} 项
+            </div>
+            <div className="h-8 px-3 inline-flex items-center rounded-full border border-border bg-canvas text-xs tabular-nums text-subtle">
+              并发 {actionConcurrency}
             </div>
             <button
               onClick={() => setExpanded((v) => !v)}
@@ -228,7 +239,7 @@ export default function BulkActionBar() {
               className={`${actionBase} border-border bg-canvas text-subtle hover:text-ink hover:border-ink`}
             >
               <ExpandIcon />
-              其他操作
+              更多操作
             </button>
           </div>
         )}
@@ -237,6 +248,7 @@ export default function BulkActionBar() {
           <>
             <div className="px-4 sm:px-5 py-2 border-b border-border/70 bg-canvas/75 text-xs text-subtle flex flex-wrap items-center gap-2">
               <span className="font-medium text-ink">建议顺序：测试 → 启用/禁用 → 删除</span>
+              <span>当前并发：{actionConcurrency}</span>
               {actionDisabled && <span className="text-[#9A6B1E]">执行中，请稍候...</span>}
             </div>
 
@@ -349,8 +361,6 @@ function ExpandIcon() {
     </svg>
   )
 }
-
-
 
 
 
