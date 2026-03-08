@@ -103,7 +103,7 @@ export default function BulkActionBar() {
 
   if (count === 0) return null
 
-  const hiddenByBatchProgress = isRunning
+  const hiddenByBatchProgress = isRunning || busyAction === 'test'
 
   async function handleBulkTest() {
     if (selectedFiles.length === 0 || actionDisabled) return
@@ -349,5 +349,6 @@ function ExpandIcon() {
     </svg>
   )
 }
+
 
 

@@ -7,7 +7,7 @@ import type { AuthFile, TestResult } from '@/types/api'
 
 const PAGE_SIZE_STORAGE_KEY = 'cliproxy_page_size'
 const CONCURRENCY_OVERRIDE_STORAGE_KEY = 'cliproxy_concurrency_override'
-const DEFAULT_CONCURRENCY = 12
+const DEFAULT_CONCURRENCY = 20
 const RESULT_FLUSH_SIZE = 100
 const MAX_PROGRESS_UPDATES = 500
 const LARGE_BATCH_THRESHOLD = 5000
@@ -30,7 +30,7 @@ function getManualConcurrencyOverride(): number | null {
     const overrideRaw = window.localStorage.getItem(CONCURRENCY_OVERRIDE_STORAGE_KEY)
     const override = Number(overrideRaw)
     if (Number.isFinite(override) && override > 0) {
-      return Math.max(1, Math.min(64, Math.floor(override)))
+      return Math.max(1, Math.min(96, Math.floor(override)))
     }
   }
   return null
@@ -286,3 +286,4 @@ export function useBatchTest() {
     wasCancelled,
   }
 }
+

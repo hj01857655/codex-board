@@ -17,7 +17,7 @@ const DEFAULT_PAGE_SIZE = 200
 const VALID_PAGE_SIZES = [50, 100, 200, 500, 1000] as const
 type PageSize = (typeof VALID_PAGE_SIZES)[number]
 const VALID_TEST_MODES: BatchTestMode[] = ['untested', 'all', 'error', 'expired', 'quota']
-const VALID_CONCURRENCY_VALUES = [4, 6, 8, 10, 12, 16, 20] as const
+const VALID_CONCURRENCY_VALUES = [8, 12, 16, 20, 24, 32, 40, 48] as const
 type ConcurrencyOverride = 'auto' | `${(typeof VALID_CONCURRENCY_VALUES)[number]}`
 const AUTO_REENABLE_SCAN_INTERVAL_MS = 90_000
 const AUTO_REENABLE_SCAN_COOLDOWN_MS = 90_000
@@ -1345,5 +1345,6 @@ function ChevronIcon() {
     </svg>
   )
 }
+
 
 
