@@ -88,12 +88,19 @@ export default function CredentialRow({ file, isSelected, onToggleSelect }: Cred
     if (!client || rowBusy) return
     if (!window.confirm(`确定要删除认证文件 "${file.name}"？此操作不可撤销。`)) return
     setRowBusy('delete')
+    const snapshot = useCredStore.getState().files
+    const snapshotIndex = snapshot.findIndex((item) => item.name === file.name)
     try {
       store.removeFile(file.name)
       try {
         await deleteAuthFile(client, file.name)
       } catch {
-        store.setFiles([...useCredStore.getState().files, file])
+        const current = useCredStore.getState().files
+        if (current.some((item) => item.name === file.name)) return
+        const insertAt = snapshotIndex >= 0 ? Math.min(snapshotIndex, current.length) : current.length
+        const restored = [...current]
+        restored.splice(insertAt, 0, file)
+        store.setFiles(restored)
       }
     } finally {
       setRowBusy(null)
