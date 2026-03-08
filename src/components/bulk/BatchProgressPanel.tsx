@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { useBatchTest } from '@/hooks/useBatchTest'
-import { useCredStore } from '@/store/credStore'
 
 export default function BatchProgressPanel() {
   const {
@@ -15,9 +14,10 @@ export default function BatchProgressPanel() {
     stats,
     cancelRequested,
   } = useBatchTest()
-  const selectedCount = useCredStore((s) => s.selected.size)
+
   const [now, setNow] = useState<number>(() => Date.now())
   const [collapsed, setCollapsed] = useState(false)
+  const [minimized, setMinimized] = useState(false)
 
   useEffect(() => {
     if (!isRunning) return
@@ -28,6 +28,7 @@ export default function BatchProgressPanel() {
   useEffect(() => {
     if (!isRunning) {
       setCollapsed(false)
+      setMinimized(false)
     }
   }, [isRunning])
 
@@ -56,8 +57,43 @@ export default function BatchProgressPanel() {
     { label: '其他', value: stats.other, tone: 'text-subtle' },
   ]
 
+  if (minimized) {
+    return (
+      <div className="fixed right-4 bottom-4 z-50 w-[min(92vw,360px)] rounded-xl border border-border bg-canvas/95 backdrop-blur shadow-[0_12px_28px_rgba(26,26,26,0.22)] overflow-hidden">
+        <div className="px-3 py-2.5 border-b border-border bg-surface/85 flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-ink truncate">测试进行中</div>
+            <div className="text-[11px] text-subtle tabular-nums mt-0.5">
+              {progress.done}/{progress.total} ({completedPercent}%) · 在途 {inFlight}
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setMinimized(false)}
+              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-[11px] font-semibold text-subtle hover:text-ink hover:border-ink"
+            >
+              展开
+            </button>
+            <button
+              onClick={cancel}
+              disabled={cancelRequested}
+              className="h-7 px-2.5 rounded-md border border-[#E9C7C7] bg-[#FFF3F3] text-[11px] font-semibold text-[#B94040] hover:bg-[#FDE8E8] disabled:opacity-60"
+            >
+              {cancelRequested ? '取消中' : '取消'}
+            </button>
+          </div>
+        </div>
+        <div className="px-3 py-2 bg-canvas">
+          <div className="h-2 bg-border rounded-full overflow-hidden">
+            <div className="h-full bg-coral rounded-full transition-all" style={{ width: `${completedPercent}%` }} />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className={`fixed left-1/2 -translate-x-1/2 ${selectedCount > 0 ? 'bottom-32' : 'bottom-4'} z-50 w-[min(96vw,760px)] rounded-2xl border border-border bg-canvas/96 backdrop-blur shadow-[0_14px_34px_rgba(26,26,26,0.22)] overflow-hidden`}>
+    <div className="fixed left-1/2 -translate-x-1/2 bottom-4 z-50 w-[min(96vw,760px)] rounded-2xl border border-border bg-canvas/96 backdrop-blur shadow-[0_14px_34px_rgba(26,26,26,0.22)] overflow-hidden">
       <div className="px-4 py-3 border-b border-border bg-surface/85 flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-semibold text-ink">测试进度面板</div>
@@ -70,7 +106,13 @@ export default function BatchProgressPanel() {
             onClick={() => setCollapsed((v) => !v)}
             className="h-8 px-3 rounded-md border border-border bg-canvas text-xs font-semibold text-subtle hover:text-ink hover:border-ink"
           >
-            {collapsed ? '展开' : '收起'}
+            {collapsed ? '展开详情' : '收起详情'}
+          </button>
+          <button
+            onClick={() => setMinimized(true)}
+            className="h-8 px-3 rounded-md border border-border bg-canvas text-xs font-semibold text-subtle hover:text-ink hover:border-ink"
+          >
+            悬浮
           </button>
           <button
             onClick={cancel}

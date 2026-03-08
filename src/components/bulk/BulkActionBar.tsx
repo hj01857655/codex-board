@@ -103,13 +103,15 @@ export default function BulkActionBar() {
 
   if (count === 0) return null
 
+  const hiddenByBatchProgress = isRunning
+
   async function handleBulkTest() {
     if (selectedFiles.length === 0 || actionDisabled) return
     setLastSummary(null)
     setBusyAction('test')
     setBusyText('正在批量测试...')
     try {
-      await testBatch(selectedFiles)
+      await testBatch(selectedFiles, { mode: 'all' })
       setLastSummary(`测试完成：共 ${selectedFiles.length} 项`)
     } catch {
       setLastSummary('测试中断：请重试')
@@ -184,7 +186,7 @@ export default function BulkActionBar() {
 
   return (
     <div
-      className="fixed bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-2 sm:px-0 w-full sm:w-auto"
+      className={`fixed bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-2 sm:px-0 w-full sm:w-auto ${hiddenByBatchProgress ? 'hidden' : ''}`}
       style={{ paddingBottom: 'max(0px, env(safe-area-inset-bottom))' }}
     >
       <div className="pointer-events-auto w-full sm:w-[min(96vw,880px)] rounded-2xl border border-border bg-canvas/96 backdrop-blur shadow-[0_16px_42px_rgba(26,26,26,0.24)] overflow-hidden">
@@ -347,3 +349,5 @@ function ExpandIcon() {
     </svg>
   )
 }
+
+
