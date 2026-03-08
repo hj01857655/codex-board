@@ -12,7 +12,6 @@ export default function BulkActionBar() {
   const selected = useCredStore((s) => s.selected)
   const files = useCredStore((s) => s.files)
   const client = useCredStore((s) => s.client)
-  const testResults = useCredStore((s) => s.testResults)
   const { clearSelection, removeFile, updateFile } = useCredStore.getState()
   const { testBatch, isRunning } = useBatchTest()
 
@@ -26,28 +25,23 @@ export default function BulkActionBar() {
     [files, selected]
   )
 
-  const hasActiveTesting = useMemo(
-    () => Object.values(testResults).some((result) => result?.status === 'queued' || result?.status === 'testing' || result?.status === 'retrying'),
-    [testResults]
-  )
-
   const count = selectedFiles.length
-  const actionDisabled = isRunning || busyAction !== null || hasActiveTesting
+  const actionDisabled = isRunning || busyAction !== null
 
   const subtitle = useMemo(() => {
-    if (isRunning || hasActiveTesting) return '测试运行中'
+    if (isRunning || busyAction === 'test') return '测试运行中'
     if (busyText) return busyText
     if (lastSummary) return lastSummary
     return '先测试，再按结果启用/禁用/删除'
-  }, [isRunning, hasActiveTesting, busyText, lastSummary])
+  }, [isRunning, busyAction, busyText, lastSummary])
 
   const subtitleTone = useMemo(() => {
     if (busyText) return 'text-[#9A6B1E]'
     if (lastSummary?.includes('失败')) return 'text-[#B94040]'
     if (lastSummary) return 'text-[#2D7A3F]'
-    if (isRunning || hasActiveTesting) return 'text-coral'
+    if (isRunning || busyAction === 'test') return 'text-coral'
     return 'text-subtle'
-  }, [busyText, isRunning, hasActiveTesting, lastSummary])
+  }, [busyText, isRunning, busyAction, lastSummary])
 
   useEffect(() => {
     if (count === 0) {
@@ -59,10 +53,10 @@ export default function BulkActionBar() {
   }, [count])
 
   useEffect(() => {
-    if (busyAction || isRunning || hasActiveTesting) {
+    if (busyAction || isRunning) {
       setExpanded(true)
     }
-  }, [busyAction, isRunning, hasActiveTesting])
+  }, [busyAction, isRunning])
 
   async function runInPool<T>(
     items: T[],
@@ -109,7 +103,7 @@ export default function BulkActionBar() {
 
   if (count === 0) return null
 
-  const hiddenByBatchProgress = isRunning || busyAction === 'test' || hasActiveTesting
+  const hiddenByBatchProgress = isRunning || busyAction === 'test'
 
   async function handleBulkTest() {
     if (selectedFiles.length === 0 || actionDisabled) return
@@ -355,6 +349,7 @@ function ExpandIcon() {
     </svg>
   )
 }
+
 
 
 
