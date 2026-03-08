@@ -13,7 +13,7 @@ export async function autoDisableIfQuota(
   options?: { optimistic?: boolean }
 ): Promise<boolean> {
   const shouldDisable = result.status === 'quota'
-    || (result.status === 'expired' && (result.statusCode === 401 || result.statusCode === 403))
+    || (result.status === 'expired' && result.statusCode === 401)
   if (!shouldDisable || file.disabled) return false
 
   const optimistic = options?.optimistic ?? true
@@ -33,3 +33,4 @@ export async function autoDisableIfQuota(
   }
   return false
 }
+
