@@ -228,7 +228,7 @@ export default function BulkActionBar() {
               className={`${actionBase} border-border bg-canvas text-subtle hover:text-ink hover:border-ink`}
             >
               <ExpandIcon />
-              更多操作
+              其他操作
             </button>
           </div>
         )}
@@ -349,6 +349,7 @@ function ExpandIcon() {
     </svg>
   )
 }
+
 
 
 
