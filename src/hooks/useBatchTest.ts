@@ -8,6 +8,7 @@ import type { AuthFile, TestResult } from '@/types/api'
 const PAGE_SIZE_STORAGE_KEY = 'cliproxy_page_size'
 const CONCURRENCY_OVERRIDE_STORAGE_KEY = 'cliproxy_concurrency_override'
 const DEFAULT_CONCURRENCY = 20
+const AUTO_CONCURRENCY_MAX = 64
 const RESULT_FLUSH_SIZE = 100
 const MAX_PROGRESS_UPDATES = 500
 const LARGE_BATCH_THRESHOLD = 5000
@@ -36,16 +37,34 @@ function getManualConcurrencyOverride(): number | null {
   return null
 }
 
-function getAutoConcurrencyByPageSize(): number {
-  if (typeof window === 'undefined') return DEFAULT_CONCURRENCY
+function getStoredPageSize(): number | null {
+  if (typeof window === 'undefined') return null
   const raw = window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY)
   const pageSize = Number(raw)
-  if (!Number.isFinite(pageSize)) return DEFAULT_CONCURRENCY
+  if (!Number.isFinite(pageSize) || pageSize <= 0) return null
+  return Math.floor(pageSize)
+}
+
+function getAutoConcurrencyByPageSize(pageSize: number | null): number {
+  if (pageSize === null) return DEFAULT_CONCURRENCY
   if (pageSize <= 50) return 8
   if (pageSize <= 100) return 10
   if (pageSize <= 200) return 12
   if (pageSize <= 500) return 16
-  return 20
+  if (pageSize <= 1000) return 24
+  if (pageSize <= 2000) return 28
+  return 32
+}
+
+function getAutoConcurrencyByTargetCount(total: number): number {
+  if (total >= 50000) return 64
+  if (total >= 20000) return 56
+  if (total >= 10000) return 48
+  if (total >= 5000) return 40
+  if (total >= 2000) return 36
+  if (total >= 1000) return 32
+  if (total >= 500) return 24
+  return DEFAULT_CONCURRENCY
 }
 
 function resolveWorkerCount(total: number): number {
@@ -53,8 +72,12 @@ function resolveWorkerCount(total: number): number {
   if (manual !== null) {
     return Math.max(1, Math.min(manual, Math.max(1, total)))
   }
-  const byPageSize = getAutoConcurrencyByPageSize()
-  return Math.max(1, Math.min(byPageSize, Math.max(1, total)))
+
+  const pageSize = getStoredPageSize()
+  const byPageSize = getAutoConcurrencyByPageSize(pageSize)
+  const byTargetCount = getAutoConcurrencyByTargetCount(total)
+  const auto = Math.min(AUTO_CONCURRENCY_MAX, Math.max(byPageSize, byTargetCount))
+  return Math.max(1, Math.min(auto, Math.max(1, total)))
 }
 
 function parseFileTimestamp(file: AuthFile): number | null {
@@ -286,4 +309,6 @@ export function useBatchTest() {
     wasCancelled,
   }
 }
+
+
 
