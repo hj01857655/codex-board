@@ -32,6 +32,62 @@ function removeResultsBatch(endpoint: string | undefined, names: string[]): void
   void deleteEndpointResultsByNamesFromDb(endpoint, names).catch(() => {})
 }
 
+interface RenameMatch {
+  fromName: string
+  toName: string
+}
+
+function buildFileIdentityKeys(file: Pick<AuthFile, 'id' | 'auth_index' | 'path'>): string[] {
+  const keys: string[] = []
+  if (file.id) keys.push('id:' + file.id)
+  if (file.auth_index) keys.push('auth:' + file.auth_index)
+  if (file.path) keys.push('path:' + file.path.toLowerCase())
+  return keys
+}
+
+export function buildRenameMatches(prevFiles: AuthFile[], nextFiles: AuthFile[]): RenameMatch[] {
+  if (prevFiles.length === 0 || nextFiles.length === 0) return []
+
+  const nextNames = new Set(nextFiles.map((file) => file.name))
+  const indexedCandidates = new Map<string, string[]>()
+
+  for (const file of prevFiles) {
+    if (!file.name || nextNames.has(file.name)) continue
+    const keys = buildFileIdentityKeys(file)
+    for (const key of keys) {
+      const existing = indexedCandidates.get(key)
+      if (existing) {
+        existing.push(file.name)
+      } else {
+        indexedCandidates.set(key, [file.name])
+      }
+    }
+  }
+
+  const consumed = new Set<string>()
+  const matches: RenameMatch[] = []
+
+  for (const file of nextFiles) {
+    if (!file.name) continue
+    const keys = buildFileIdentityKeys(file)
+
+    let fromName: string | undefined
+    for (const key of keys) {
+      const candidates = indexedCandidates.get(key)
+      if (!candidates) continue
+      fromName = candidates.find((name) => !consumed.has(name))
+      if (fromName) break
+    }
+
+    if (!fromName || fromName === file.name) continue
+
+    consumed.add(fromName)
+    matches.push({ fromName, toName: file.name })
+  }
+
+  return matches
+}
+
 interface CredStore {
   connection: ConnectionConfig | null
   connected: boolean
@@ -105,11 +161,17 @@ export const useCredStore = create<CredStore>((set) => ({
   setFiles: (files) =>
     set((state) => {
       const existingNames = new Set(files.map((f) => f.name))
+      const renameMatches = buildRenameMatches(state.files, files)
 
       const nextSelected = new Set<string>()
       for (const name of state.selected) {
         if (existingNames.has(name)) {
           nextSelected.add(name)
+        }
+      }
+      for (const match of renameMatches) {
+        if (state.selected.has(match.fromName)) {
+          nextSelected.add(match.toName)
         }
       }
 
@@ -123,7 +185,17 @@ export const useCredStore = create<CredStore>((set) => ({
         }
       }
 
+      const movedResults: Record<string, TestResult> = {}
+      for (const match of renameMatches) {
+        if (nextTestResults[match.toName]) continue
+        const previous = state.testResults[match.fromName]
+        if (!previous) continue
+        nextTestResults[match.toName] = previous
+        movedResults[match.toName] = previous
+      }
+
       removeResultsBatch(state.connection?.endpoint, removedNames)
+      persistResultsBatch(state.connection?.endpoint, movedResults)
 
       return {
         files,
