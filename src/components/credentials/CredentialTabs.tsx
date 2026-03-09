@@ -26,6 +26,7 @@ const VALID_TEST_MODES: BatchTestMode[] = ['untested', 'all', 'error', 'expired'
 const VALID_CONCURRENCY_VALUES = [8, 12, 16, 20, 24, 32, 40, 48] as const
 type ConcurrencyOverride = 'auto' | `${(typeof VALID_CONCURRENCY_VALUES)[number]}`
 const AUTO_SCAN_ENABLED_KEY = 'cliproxy_auto_scan_enabled'
+const AUDIT_PANEL_EXPANDED_KEY = 'cliproxy_audit_panel_expanded'
 const AUTO_REENABLE_STALE_MS = 30 * 60 * 1000
 const AUTO_REENABLE_MAX_TARGETS = 300
 const AUTO_REENABLE_MIN_GAP_MS = 8_000
@@ -104,6 +105,13 @@ function loadAutoScanEnabled(): boolean {
   return raw !== '0' && raw.toLowerCase() !== 'false'
 }
 
+function loadAuditPanelExpanded(): boolean {
+  if (typeof window === 'undefined') return false
+  const raw = window.localStorage.getItem(AUDIT_PANEL_EXPANDED_KEY)
+  if (!raw) return false
+  return raw === '1' || raw.toLowerCase() === 'true'
+}
+
 function formatClockTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false })
 }
@@ -149,6 +157,7 @@ export default function CredentialTabs() {
   const [testScope, setTestScope] = useState<TestScope>('filtered')
   const [concurrencyOverride, setConcurrencyOverride] = useState<ConcurrencyOverride>(() => loadConcurrencyOverride())
   const [autoScanEnabled, setAutoScanEnabled] = useState<boolean>(() => loadAutoScanEnabled())
+  const [auditPanelExpanded, setAuditPanelExpanded] = useState<boolean>(() => loadAuditPanelExpanded())
   const [scanRunning, setScanRunning] = useState(false)
   const [scanSummary, setScanSummary] = useState<string | null>(null)
   const [autoScanNextAt, setAutoScanNextAt] = useState<number | null>(null)
@@ -187,6 +196,11 @@ export default function CredentialTabs() {
     window.localStorage.setItem(AUTO_SCAN_ENABLED_KEY, autoScanEnabled ? '1' : '0')
   }, [autoScanEnabled])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(AUDIT_PANEL_EXPANDED_KEY, auditPanelExpanded ? '1' : '0')
+  }, [auditPanelExpanded])
+
 
   useEffect(() => {
     if (!bulkMenuOpen) return
@@ -223,6 +237,11 @@ export default function CredentialTabs() {
   const bindAuditEndpoint = useTaskAuditStore((s) => s.bindEndpoint)
   const auditRecords = useTaskAuditStore((s) => s.records)
   const recentAuditTasks = useMemo(() => auditRecords.slice(0, 3), [auditRecords])
+  const runningAuditCount = useMemo(
+    () => auditRecords.filter((record) => record.status === 'running').length,
+    [auditRecords]
+  )
+  const latestAuditTask = recentAuditTasks[0] ?? null
   const [currentPage, setCurrentPage] = useState(1)
 
   useEffect(() => {
@@ -1565,39 +1584,69 @@ export default function CredentialTabs() {
       {recentAuditTasks.length > 0 && (
         <div className="px-4 py-2 border-b border-border bg-canvas">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">最近任务审计</div>
-            <button
-              onClick={handleExportAuditRecords}
-              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-[11px] font-semibold text-subtle hover:text-ink hover:border-ink transition-colors"
-              title="导出当前端点任务审计"
-            >
-              导出JSON
-            </button>
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">最近任务审计</div>
+              <span className="px-2 py-0.5 rounded-full text-[11px] bg-surface text-subtle tabular-nums">
+                {auditRecords.length} 条
+              </span>
+              {runningAuditCount > 0 && (
+                <span className="px-2 py-0.5 rounded-full text-[11px] bg-[#FFF7ED] text-[#9A6B1E] tabular-nums">
+                  运行中 {runningAuditCount}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={handleExportAuditRecords}
+                className="h-7 px-2.5 rounded-md border border-border bg-canvas text-[11px] font-semibold text-subtle hover:text-ink hover:border-ink transition-colors"
+                title="导出当前端点任务审计"
+              >
+                导出JSON
+              </button>
+              <button
+                onClick={() => setAuditPanelExpanded((v) => !v)}
+                className="h-7 px-2.5 rounded-md border border-border bg-canvas text-[11px] font-semibold text-subtle hover:text-ink hover:border-ink transition-colors inline-flex items-center gap-1"
+                title={auditPanelExpanded ? '收起任务审计' : '展开任务审计'}
+              >
+                {auditPanelExpanded ? '收起' : '展开'}
+                <span className={`transition-transform ${auditPanelExpanded ? 'rotate-180' : ''}`}>
+                  <ChevronIcon />
+                </span>
+              </button>
+            </div>
           </div>
+
           <div className="mt-1 text-[11px] text-subtle truncate">
-            当前端点：{connectionEndpoint ?? '未连接'} · 记录 {auditRecords.length} 条
+            当前端点：{connectionEndpoint ?? '未连接'}
+            {!auditPanelExpanded && latestAuditTask && (
+              <span className="ml-2">
+                · 最新：{latestAuditTask.label}（{getTaskStatusText(latestAuditTask.status)}）
+              </span>
+            )}
           </div>
-          <div className="mt-1.5 space-y-1">
-            {recentAuditTasks.map((task) => (
-              <div key={task.taskId} className="flex items-center justify-between gap-2 text-xs">
-                <div className="min-w-0">
-                  <div className="text-ink truncate">{task.label}</div>
-                  <div className="text-[11px] text-subtle truncate">
-                    {shortTaskId(task.taskId)} · {task.scope} · {task.source === 'auto' ? '自动' : '手动'} · {formatClockTime(task.startedAt)}
+
+          {auditPanelExpanded && (
+            <div className="mt-1.5 space-y-1">
+              {recentAuditTasks.map((task) => (
+                <div key={task.taskId} className="flex items-center justify-between gap-2 text-xs">
+                  <div className="min-w-0">
+                    <div className="text-ink truncate">{task.label}</div>
+                    <div className="text-[11px] text-subtle truncate">
+                      {shortTaskId(task.taskId)} · {task.scope} · {task.source === 'auto' ? '自动' : '手动'} · {formatClockTime(task.startedAt)}
+                    </div>
+                  </div>
+                  <div className={`px-2 py-0.5 rounded-full text-[11px] whitespace-nowrap ${getTaskStatusClass(task.status)}`}>
+                    {getTaskStatusText(task.status)}
+                  </div>
+                  <div className="tabular-nums text-subtle whitespace-nowrap">
+                    {task.success}/{task.total}
                   </div>
                 </div>
-                <div className={`px-2 py-0.5 rounded-full text-[11px] whitespace-nowrap ${getTaskStatusClass(task.status)}`}>
-                  {getTaskStatusText(task.status)}
-                </div>
-                <div className="tabular-nums text-subtle whitespace-nowrap">
-                  {task.success}/{task.total}
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
-
       <div className="px-4 py-2 border-b border-border bg-surface/65">
         <div className="flex flex-wrap items-center gap-2">
           <button
