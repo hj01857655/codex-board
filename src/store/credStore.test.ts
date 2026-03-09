@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
-import { buildRenameMatches } from '@/store/credStore'
-import type { AuthFile } from '@/types/api'
+import { beforeEach, describe, expect, it } from 'vitest'
+import { buildRenameMatches, useCredStore } from '@/store/credStore'
+import type { AuthFile, TestResult } from '@/types/api'
 
 function makeFile(overrides: Partial<AuthFile>): AuthFile {
   return {
@@ -29,6 +29,23 @@ function makeFile(overrides: Partial<AuthFile>): AuthFile {
     id_token: overrides.id_token,
   }
 }
+
+function makeResult(status: TestResult['status'], testedAt: number): TestResult {
+  return { status, testedAt }
+}
+
+beforeEach(() => {
+  useCredStore.setState({
+    connection: null,
+    connected: false,
+    client: null,
+    files: [],
+    loading: false,
+    refreshing: false,
+    testResults: {},
+    selected: new Set<string>(),
+  })
+})
 
 describe('buildRenameMatches', () => {
   it('同 auth_index 且旧文件名消失时，识别为重命名', () => {
@@ -81,5 +98,68 @@ describe('buildRenameMatches', () => {
     expect(buildRenameMatches(prev, next)).toEqual([
       { fromName: 'once.json', toName: 'first.json' },
     ])
+  })
+})
+
+describe('useCredStore.setFiles', () => {
+  it('重命名后应迁移选中状态和测试结果', () => {
+    const oldFile = makeFile({ id: 'rename-1', auth_index: '101', name: 'old.json' })
+    const newFile = makeFile({ id: 'rename-1', auth_index: '101', name: 'new.json' })
+
+    useCredStore.setState({
+      files: [oldFile],
+      selected: new Set(['old.json']),
+      testResults: {
+        'old.json': makeResult('valid', 1000),
+      },
+    })
+
+    useCredStore.getState().setFiles([newFile])
+
+    const state = useCredStore.getState()
+    expect(state.selected.has('new.json')).toBe(true)
+    expect(state.selected.has('old.json')).toBe(false)
+    expect(state.testResults['new.json']).toEqual(makeResult('valid', 1000))
+    expect(state.testResults['old.json']).toBeUndefined()
+  })
+
+  it('文件被移除时应清理选中与结果', () => {
+    const keepFile = makeFile({ id: 'keep-1', name: 'keep.json' })
+    const dropFile = makeFile({ id: 'drop-1', name: 'drop.json' })
+
+    useCredStore.setState({
+      files: [keepFile, dropFile],
+      selected: new Set(['keep.json', 'drop.json']),
+      testResults: {
+        'keep.json': makeResult('quota', 2000),
+        'drop.json': makeResult('expired', 1500),
+      },
+    })
+
+    useCredStore.getState().setFiles([keepFile])
+
+    const state = useCredStore.getState()
+    expect(Array.from(state.selected)).toEqual(['keep.json'])
+    expect(state.testResults['keep.json']).toEqual(makeResult('quota', 2000))
+    expect(state.testResults['drop.json']).toBeUndefined()
+  })
+
+  it('新文件名已有结果时，不应被旧结果覆盖', () => {
+    const oldFile = makeFile({ id: 'same-id', name: 'old-name.json' })
+    const newFile = makeFile({ id: 'same-id', name: 'new-name.json' })
+
+    useCredStore.setState({
+      files: [oldFile],
+      testResults: {
+        'old-name.json': makeResult('expired', 1000),
+        'new-name.json': makeResult('valid', 3000),
+      },
+    })
+
+    useCredStore.getState().setFiles([newFile])
+
+    const state = useCredStore.getState()
+    expect(state.testResults['new-name.json']).toEqual(makeResult('valid', 3000))
+    expect(state.testResults['old-name.json']).toBeUndefined()
   })
 })
