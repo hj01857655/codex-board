@@ -14,6 +14,10 @@ describe('buildFailedNameHint', () => {
   it('失败项较多时返回示例 + 总数', () => {
     expect(buildFailedNameHint(['a.json', 'b.json', 'c.json', 'd.json'], 4)).toBe('失败示例：a.json，b.json，c.json 等 4 项')
   })
+
+  it('失败名重复时应去重展示', () => {
+    expect(buildFailedNameHint(['dup.json', 'dup.json', 'ok.json'], 3)).toBe('失败示例：dup.json，ok.json 等 3 项')
+  })
 })
 
 describe('appendFailedNameHint', () => {

@@ -3,6 +3,7 @@ import { useCredStore } from '@/store/credStore'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
 import { useBatchTest } from '@/hooks/useBatchTest'
 import { runOperationInPool } from '@/lib/operationOrchestrator'
+import { appendFailedNameHint } from '@/components/credentials/bulkSummary'
 
 type BusyAction = 'test' | 'enable' | 'disable' | 'delete' | null
 type BatchOutcome = { success: number; failed: number }
@@ -24,13 +25,6 @@ function resolveActionConcurrency(total: number): number {
   const base = manual ?? ACTION_CONCURRENCY_DEFAULT
   if (total <= 0) return base
   return Math.max(1, Math.min(base, total))
-}
-
-function summarizeFailedNames(names: string[]): string {
-  if (names.length === 0) return ''
-  const preview = names.slice(0, 3)
-  const rest = names.length - preview.length
-  return rest > 0 ? `（失败项示例：${preview.join('，')} 等 ${names.length} 项）` : `（失败项：${preview.join('，')}）`
 }
 
 export default function BulkActionBar() {
@@ -152,7 +146,8 @@ export default function BulkActionBar() {
         },
         (done, max) => setBusyText(`${actionLabel}中 ${done}/${max}（并发 ${actionConcurrency}）`)
       )
-      setLastSummary(`${actionLabel}完成：成功 ${outcome.success}，失败 ${outcome.failed}${summarizeFailedNames(failedNames)}`)
+      const baseSummary = `${actionLabel}完成：成功 ${outcome.success}，失败 ${outcome.failed}`
+      setLastSummary(appendFailedNameHint(baseSummary, failedNames, outcome.failed))
     } finally {
       clearSelection()
       setBusyAction(null)
@@ -182,7 +177,8 @@ export default function BulkActionBar() {
         },
         (done, max) => setBusyText(`删除中 ${done}/${max}（并发 ${actionConcurrency}）`)
       )
-      setLastSummary(`删除完成：成功 ${outcome.success}，失败 ${outcome.failed}${summarizeFailedNames(failedNames)}`)
+      const baseSummary = `删除完成：成功 ${outcome.success}，失败 ${outcome.failed}`
+      setLastSummary(appendFailedNameHint(baseSummary, failedNames, outcome.failed))
     } finally {
       clearSelection()
       setBusyAction(null)
@@ -361,6 +357,7 @@ function ExpandIcon() {
     </svg>
   )
 }
+
 
 
 
