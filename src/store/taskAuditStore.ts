@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { loadTaskAuditRecords, saveTaskAuditRecords } from '@/lib/taskAuditStorage'
 
 export type TaskAuditType = 'test' | 'scan' | 'bulk' | 'smart'
 export type TaskAuditSource = 'manual' | 'auto'
@@ -46,7 +47,9 @@ interface FinishTaskInput {
 }
 
 interface TaskAuditStore {
+  endpoint: string | null
   records: TaskAuditRecord[]
+  bindEndpoint: (endpoint: string | null | undefined) => void
   startTask: (input: StartTaskInput) => string
   updateTask: (taskId: string, input: UpdateTaskInput) => void
   finishTask: (taskId: string, input: FinishTaskInput) => void
@@ -73,62 +76,101 @@ function upsertRecord(
   return next
 }
 
-export const useTaskAuditStore = create<TaskAuditStore>((set) => ({
-  records: [],
+function normalizeEndpoint(endpoint: string | null | undefined): string | null {
+  if (!endpoint) return null
+  const trimmed = endpoint.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
 
-  startTask: (input) => {
-    const taskId = makeTaskId(input.type)
-    const now = Date.now()
+function trimRecords(records: TaskAuditRecord[]): TaskAuditRecord[] {
+  if (records.length <= MAX_RECORDS) return records
+  return records.slice(0, MAX_RECORDS)
+}
 
-    const nextRecord: TaskAuditRecord = {
-      taskId,
-      type: input.type,
-      source: input.source,
-      label: input.label,
-      scope: input.scope ?? '默认',
-      status: 'running',
-      total: Math.max(0, input.total),
-      done: 0,
-      success: 0,
-      failed: 0,
-      detail: input.detail,
-      startedAt: now,
-      finishedAt: null,
-    }
+export const useTaskAuditStore = create<TaskAuditStore>((set, get) => {
+  function persistCurrentRecords(): void {
+    const state = get()
+    if (!state.endpoint) return
+    saveTaskAuditRecords(state.endpoint, state.records)
+  }
 
-    set((state) => ({
-      records: [nextRecord, ...state.records].slice(0, MAX_RECORDS),
-    }))
+  return {
+    endpoint: null,
+    records: [],
 
-    return taskId
-  },
+    bindEndpoint: (endpoint) => {
+      const normalized = normalizeEndpoint(endpoint)
+      if (!normalized) {
+        set({ endpoint: null, records: [] })
+        return
+      }
 
-  updateTask: (taskId, input) => {
-    set((state) => ({
-      records: upsertRecord(state.records, taskId, (record) => ({
-        ...record,
-        done: input.done ?? record.done,
-        success: input.success ?? record.success,
-        failed: input.failed ?? record.failed,
-        detail: input.detail ?? record.detail,
-        status: input.status ?? record.status,
-      })),
-    }))
-  },
+      const loaded = trimRecords(loadTaskAuditRecords(normalized))
+      set({ endpoint: normalized, records: loaded })
+    },
 
-  finishTask: (taskId, input) => {
-    set((state) => ({
-      records: upsertRecord(state.records, taskId, (record) => ({
-        ...record,
-        status: input.status,
-        done: input.done ?? record.done,
-        success: input.success ?? record.success,
-        failed: input.failed ?? record.failed,
-        detail: input.detail ?? record.detail,
-        finishedAt: Date.now(),
-      })),
-    }))
-  },
+    startTask: (input) => {
+      const taskId = makeTaskId(input.type)
+      const now = Date.now()
 
-  clear: () => set({ records: [] }),
-}))
+      const nextRecord: TaskAuditRecord = {
+        taskId,
+        type: input.type,
+        source: input.source,
+        label: input.label,
+        scope: input.scope ?? '默认',
+        status: 'running',
+        total: Math.max(0, input.total),
+        done: 0,
+        success: 0,
+        failed: 0,
+        detail: input.detail,
+        startedAt: now,
+        finishedAt: null,
+      }
+
+      set((state) => ({
+        records: trimRecords([nextRecord, ...state.records]),
+      }))
+
+      persistCurrentRecords()
+      return taskId
+    },
+
+    updateTask: (taskId, input) => {
+      set((state) => ({
+        records: upsertRecord(state.records, taskId, (record) => ({
+          ...record,
+          done: input.done ?? record.done,
+          success: input.success ?? record.success,
+          failed: input.failed ?? record.failed,
+          detail: input.detail ?? record.detail,
+          status: input.status ?? record.status,
+        })),
+      }))
+
+      persistCurrentRecords()
+    },
+
+    finishTask: (taskId, input) => {
+      set((state) => ({
+        records: upsertRecord(state.records, taskId, (record) => ({
+          ...record,
+          status: input.status,
+          done: input.done ?? record.done,
+          success: input.success ?? record.success,
+          failed: input.failed ?? record.failed,
+          detail: input.detail ?? record.detail,
+          finishedAt: Date.now(),
+        })),
+      }))
+
+      persistCurrentRecords()
+    },
+
+    clear: () => {
+      set({ records: [] })
+      persistCurrentRecords()
+    },
+  }
+})

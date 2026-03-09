@@ -187,6 +187,7 @@ export default function CredentialTabs() {
     window.localStorage.setItem(AUTO_SCAN_ENABLED_KEY, autoScanEnabled ? '1' : '0')
   }, [autoScanEnabled])
 
+
   useEffect(() => {
     if (!bulkMenuOpen) return
     function handleClickOutside(e: MouseEvent) {
@@ -215,11 +216,18 @@ export default function CredentialTabs() {
   const client = useCredStore((s) => s.client)
   const loading = useCredStore((s) => s.loading)
   const refreshing = useCredStore((s) => s.refreshing)
+  const connectionEndpoint = useCredStore((s) => s.connection?.endpoint ?? null)
   const { updateFile, removeFile, clearSelection } = useCredStore.getState()
   const { refresh } = useConnection()
   const { testBatch, isRunning } = useBatchTest()
-  const recentAuditTasks = useTaskAuditStore((s) => s.records.slice(0, 3))
+  const bindAuditEndpoint = useTaskAuditStore((s) => s.bindEndpoint)
+  const auditRecords = useTaskAuditStore((s) => s.records)
+  const recentAuditTasks = useMemo(() => auditRecords.slice(0, 3), [auditRecords])
   const [currentPage, setCurrentPage] = useState(1)
+
+  useEffect(() => {
+    bindAuditEndpoint(connectionEndpoint)
+  }, [bindAuditEndpoint, connectionEndpoint])
 
   const providers = useMemo(() => {
     const set = new Set(files.map((f) => f.provider || f.type || '未知'))
@@ -505,6 +513,15 @@ export default function CredentialTabs() {
     testBatch,
   ])
 
+  const runReenableScanRef = useRef(runReenableScan)
+  useEffect(() => {
+    runReenableScanRef.current = runReenableScan
+  }, [runReenableScan])
+
+  const dispatchReenableScan = useCallback((reason: 'auto' | 'manual') => {
+    void runReenableScanRef.current(reason)
+  }, [])
+
   const filesInProviderScope = useMemo(() => {
     const byProvider = activeProvider === '全部'
       ? files
@@ -750,7 +767,7 @@ export default function CredentialTabs() {
       setAutoScanReason('blocked')
       setAutoScanNextAt(Date.now() + delay)
       const timer = window.setTimeout(() => {
-        void runReenableScan('auto')
+        dispatchReenableScan('auto')
       }, delay)
       return () => window.clearTimeout(timer)
     }
@@ -762,10 +779,10 @@ export default function CredentialTabs() {
     setAutoScanNextAt(Date.now() + delay)
 
     const timer = window.setTimeout(() => {
-      void runReenableScan('auto')
+      dispatchReenableScan('auto')
     }, delay)
     return () => window.clearTimeout(timer)
-  }, [autoScanEnabled, bulkDisabling, client, files, isRunning, runReenableScan, scanRunning, testResults])
+  }, [autoScanEnabled, bulkDisabling, client, dispatchReenableScan, files, isRunning, scanRunning, testResults])
 
   useEffect(() => {
     if (isRunning) return
@@ -818,8 +835,8 @@ export default function CredentialTabs() {
     if (!client || !autoScanEnabled) return
     // 事件触发扫描需要立即生效，不走轮询冷却窗口
     lastAutoScanAtRef.current = 0
-    void runReenableScan('auto')
-  }, [autoScanEnabled, client, runReenableScan])
+    dispatchReenableScan('auto')
+  }, [autoScanEnabled, client, dispatchReenableScan])
 
   async function handleRefreshAndScan() {
     if (refreshing) return
@@ -1242,6 +1259,36 @@ export default function CredentialTabs() {
     }
   }
 
+  function handleExportAuditRecords(): void {
+    if (auditRecords.length === 0 || typeof window === 'undefined') return
+
+    const exportedAt = new Date()
+    const endpointSlug = (connectionEndpoint ?? 'disconnected')
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40) || 'endpoint'
+    const stamp = exportedAt.toISOString().replace(/[:.]/g, '-')
+
+    const payload = {
+      exportedAt: exportedAt.toISOString(),
+      endpoint: connectionEndpoint,
+      total: auditRecords.length,
+      records: auditRecords,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    })
+    const url = window.URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `task-audit_${endpointSlug}_${stamp}.json`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.URL.revokeObjectURL(url)
+  }
+
   function commitPageJump(): void {
     const parsed = Number(pageJumpInput)
     if (!Number.isFinite(parsed)) {
@@ -1400,7 +1447,7 @@ export default function CredentialTabs() {
           </button>
 
           <button
-            onClick={() => void runReenableScan('manual')}
+            onClick={() => dispatchReenableScan('manual')}
             disabled={isRunning || scanRunning}
             className="h-8 inline-flex items-center gap-1.5 px-3 text-xs font-semibold border border-[#BDD9C2] bg-[#EDF9F0] text-[#2D7A3F] rounded-md hover:bg-[#E2F4E7] disabled:opacity-50 transition-colors"
             title="扫描已禁用账号并自动启用可用项"
@@ -1517,7 +1564,19 @@ export default function CredentialTabs() {
 
       {recentAuditTasks.length > 0 && (
         <div className="px-4 py-2 border-b border-border bg-canvas">
-          <div className="text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">最近任务审计</div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[11px] font-semibold text-subtle tracking-[0.04em] uppercase">最近任务审计</div>
+            <button
+              onClick={handleExportAuditRecords}
+              className="h-7 px-2.5 rounded-md border border-border bg-canvas text-[11px] font-semibold text-subtle hover:text-ink hover:border-ink transition-colors"
+              title="导出当前端点任务审计"
+            >
+              导出JSON
+            </button>
+          </div>
+          <div className="mt-1 text-[11px] text-subtle truncate">
+            当前端点：{connectionEndpoint ?? '未连接'} · 记录 {auditRecords.length} 条
+          </div>
           <div className="mt-1.5 space-y-1">
             {recentAuditTasks.map((task) => (
               <div key={task.taskId} className="flex items-center justify-between gap-2 text-xs">
@@ -1827,6 +1886,12 @@ function ChevronIcon() {
     </svg>
   )
 }
+
+
+
+
+
+
 
 
 
