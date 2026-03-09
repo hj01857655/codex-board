@@ -8,6 +8,7 @@ import { getEffectiveStatus, isExpiredStatus } from '@/utils/statusUtils'
 import { deleteAuthFile, patchAuthFileStatus } from '@/lib/management'
 import { runOperationInPool, type OperationPoolResult, type OperationProgressSnapshot } from '@/lib/operationOrchestrator'
 import { useTaskAuditStore, type TaskAuditStatus } from '@/store/taskAuditStore'
+import { appendFailedNameHint, buildFailedNameHint } from '@/components/credentials/bulkSummary'
 import CredentialTable, { type SortMode } from './CredentialTable'
 import UploadModal from './UploadModal'
 import type { AuthFile } from '@/types/api'
@@ -42,7 +43,7 @@ const BULK_PROGRESS_UPDATE_INTERVAL_MS = 120
 
 type AutoScanReason = 'idle' | 'due' | 'scheduled' | 'blocked' | 'off'
 type BulkSummary = { label: string; success: number; failed: number; detail?: string }
-type BulkOperationRunResult = OperationPoolResult
+type BulkOperationRunResult = OperationPoolResult & { failedNames: string[] }
 type BulkOperationProgress = Pick<OperationProgressSnapshot, 'done' | 'total' | 'success' | 'failed'>
 type BulkOperationRunOptions = {
   showSummary?: boolean
@@ -140,6 +141,10 @@ function getTaskStatusClass(status: TaskAuditStatus): string {
 
 function shortTaskId(taskId: string): string {
   return taskId.length > 24 ? taskId.slice(0, 24) + '...' : taskId
+}
+
+function mergeFailedNames(...groups: string[][]): string[] {
+  return Array.from(new Set(groups.flat().filter((name) => name.length > 0)))
 }
 
 export default function CredentialTabs() {
@@ -465,7 +470,7 @@ export default function CredentialTabs() {
         .filter((file): file is AuthFile => !!file)
         .filter((file) => file.disabled && hasAvailableQuotaByResult(file, latestState.testResults[file.name]))
 
-      let enableResult: BulkOperationRunResult = { success: 0, failed: 0, total: 0 }
+      let enableResult: BulkOperationRunResult = { success: 0, failed: 0, total: 0, failedNames: [] }
       if (canEnableTargets.length > 0) {
         enableResult = await runBulkOperationInPool(
           canEnableTargets,
@@ -486,10 +491,13 @@ export default function CredentialTabs() {
         done: scanSnapshot.done,
         success: scanSuccess,
         failed: scanFailed,
-        detail:
+        detail: appendFailedNameHint(
           '扫描完成：' + scanSnapshot.done + '/' + scanSnapshot.total +
           '，自动启用成功 ' + enableResult.success +
           '，失败 ' + enableResult.failed,
+          enableResult.failedNames,
+          enableResult.failed
+        ),
       })
 
       if (canEnableTargets.length === 0) {
@@ -957,7 +965,7 @@ export default function CredentialTabs() {
     options: BulkOperationRunOptions = {}
   ): Promise<BulkOperationRunResult> {
     if (targets.length === 0) {
-      return { success: 0, failed: 0, total: 0 }
+      return { success: 0, failed: 0, total: 0, failedNames: [] }
     }
 
     const {
@@ -977,12 +985,25 @@ export default function CredentialTabs() {
     setBulkProgress({ label, done: 0, total: targets.length })
     onProgress?.({ done: 0, total: targets.length, success: 0, failed: 0 })
 
+    const failedNames: string[] = []
+
     try {
       const result = await runOperationInPool({
         items: targets,
         maxConcurrency: BULK_ACTION_CONCURRENCY,
         progressIntervalMs: BULK_PROGRESS_UPDATE_INTERVAL_MS,
-        worker,
+        worker: async (file) => {
+          try {
+            const ok = await worker(file)
+            if (!ok) {
+              failedNames.push(file.name)
+            }
+            return ok
+          } catch {
+            failedNames.push(file.name)
+            return false
+          }
+        },
         onProgress: (snapshot) => {
           setBulkProgress({ label, done: snapshot.done, total: snapshot.total })
           onProgress?.({
@@ -994,10 +1015,19 @@ export default function CredentialTabs() {
         },
       })
 
+      const mergedFailedNames = mergeFailedNames(failedNames)
       if (showSummary) {
-        setBulkSummary({ label, success: result.success, failed: result.failed })
+        setBulkSummary({
+          label,
+          success: result.success,
+          failed: result.failed,
+          detail: buildFailedNameHint(mergedFailedNames, result.failed) || undefined,
+        })
       }
-      return result
+      return {
+        ...result,
+        failedNames: mergedFailedNames,
+      }
     } finally {
       if (clearSelectionAfter) {
         clearSelection()
@@ -1125,27 +1155,31 @@ export default function CredentialTabs() {
     const retestSuccess = Math.max(0, initial.errorTargets.length - retestFailed)
     const success = retestSuccess + disableResult.success + enableResult.success
     const failed = retestFailed + disableResult.failed + enableResult.failed
+    const actionFailedNames = mergeFailedNames(disableResult.failedNames, enableResult.failedNames)
+
+    const smartDetailBase =
+      '重试错误 ' + initial.errorTargets.length +
+      '（失败 ' + retestFailed + '），禁用成功 ' + disableResult.success + '/' + disableResult.total +
+      '，启用成功 ' + enableResult.success + '/' + enableResult.total
+    const smartDetail = appendFailedNameHint(
+      smartDetailBase,
+      actionFailedNames,
+      disableResult.failed + enableResult.failed
+    )
 
     useTaskAuditStore.getState().finishTask(taskId, {
       status: resolveTaskOutcomeStatus(success, failed),
       done: totalCandidates,
       success,
       failed,
-      detail:
-        '重试错误 ' + initial.errorTargets.length +
-        '（失败 ' + retestFailed + '），禁用成功 ' + disableResult.success + '/' + disableResult.total +
-        '，启用成功 ' + enableResult.success + '/' + enableResult.total,
+      detail: smartDetail,
     })
 
     setBulkSummary({
       label: '智能一键处理',
       success,
       failed,
-      detail:
-        '重试错误 ' + initial.errorTargets.length +
-        '（失败 ' + retestFailed + '），禁用成功 ' + disableResult.success + '/' + disableResult.total +
-        '，启用成功 ' + enableResult.success + '/' + enableResult.total +
-        ' · 任务 ' + taskId,
+      detail: smartDetail + ' · 任务 ' + taskId,
     })
   }
 
@@ -1176,6 +1210,7 @@ export default function CredentialTabs() {
         done: result.total,
         success: result.success,
         failed: result.failed,
+        detail: buildFailedNameHint(result.failedNames, result.failed) || undefined,
       })
     } catch {
       useTaskAuditStore.getState().finishTask(taskId, {
@@ -1227,6 +1262,7 @@ export default function CredentialTabs() {
         done: result.total,
         success: result.success,
         failed: result.failed,
+        detail: buildFailedNameHint(result.failedNames, result.failed) || undefined,
       })
     } catch {
       useTaskAuditStore.getState().finishTask(taskId, {
@@ -1266,6 +1302,7 @@ export default function CredentialTabs() {
         done: result.total,
         success: result.success,
         failed: result.failed,
+        detail: buildFailedNameHint(result.failedNames, result.failed) || undefined,
       })
     } catch {
       useTaskAuditStore.getState().finishTask(taskId, {
@@ -1935,6 +1972,13 @@ function ChevronIcon() {
     </svg>
   )
 }
+
+
+
+
+
+
+
 
 
 
