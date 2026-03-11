@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.worktrees/
+worktrees/
 
 .DS_Store
 *.log
@@ -9,7 +11,7 @@ dist/
 !.env.example
 
 .idea/
-.vscode/
+
 
 .wrangler/
 .cache/
