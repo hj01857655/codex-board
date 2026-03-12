@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import { useCredStore } from '@/store/credStore'
-import { disableAuthFiles, deleteAuthFiles, fetchAuthFiles } from '@/lib/management'
+import { disableAuthFiles, deleteAuthFiles } from '@/lib/management'
 import { useBatchTest } from '@/hooks/useBatchTest'
 
 export default function BulkActionBar() {
-  const { selected, files, client, clearSelection, updateFile, removeFile, setFiles } = useCredStore()
+  const { selected, files, client, clearSelection, updateFile, removeFile } = useCredStore()
   const { testBatch, isRunning: isTesting } = useBatchTest()
   const [processing, setProcessing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -44,11 +44,27 @@ export default function BulkActionBar() {
         updateFile(name, { disabled: true, status: 'disabled' })
       }
 
-      await disableAuthFiles(client, names)
+      const result = await disableAuthFiles(client, names)
+      
+      // 只回滚失败的文件
+      if (result.failed.length > 0) {
+        for (const name of result.failed) {
+          const original = originalStates.get(name)
+          if (original) {
+            updateFile(name, original)
+          }
+        }
+        if (result.succeeded.length > 0) {
+          setError(`成功禁用 ${result.succeeded.length} 个，失败 ${result.failed.length} 个`)
+        } else {
+          setError('批量禁用失败')
+        }
+      }
+      
       clearSelection()
     } catch (err) {
       setError(err instanceof Error ? err.message : '批量禁用失败')
-      // 回滚到原始状态
+      // 回滚所有
       for (const [name, original] of originalStates) {
         updateFile(name, original)
       }
@@ -93,19 +109,24 @@ export default function BulkActionBar() {
         return
       }
 
-      await deleteAuthFiles(client, names)
+      const result = await deleteAuthFiles(client, names)
 
-      // 乐观更新
-      for (const name of names) {
+      // 只删除成功的文件
+      for (const name of result.succeeded) {
         removeFile(name)
+      }
+
+      if (result.failed.length > 0) {
+        if (result.succeeded.length > 0) {
+          setError(`成功删除 ${result.succeeded.length} 个，失败 ${result.failed.length} 个`)
+        } else {
+          setError('批量删除失败')
+        }
       }
 
       clearSelection()
     } catch (err) {
       setError(err instanceof Error ? err.message : '批量删除失败')
-      // 回滚
-      const refreshedFiles = await fetchAuthFiles(client)
-      setFiles(refreshedFiles)
     } finally {
       setProcessing(false)
     }

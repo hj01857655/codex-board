@@ -41,15 +41,39 @@ export async function patchAuthFileStatus(
 export async function disableAuthFiles(
   client: ApiClient,
   names: string[]
-): Promise<void> {
-  await Promise.all(names.map((name) => patchAuthFileStatus(client, name, true)))
+): Promise<{ succeeded: string[]; failed: string[] }> {
+  const results = await Promise.allSettled(
+    names.map((name) => patchAuthFileStatus(client, name, true).then(() => name))
+  )
+  const succeeded: string[] = []
+  const failed: string[] = []
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      succeeded.push(result.value)
+    } else {
+      failed.push(names[index])
+    }
+  })
+  return { succeeded, failed }
 }
 
 export async function deleteAuthFiles(
   client: ApiClient,
   names: string[]
-): Promise<void> {
-  await Promise.all(names.map((name) => deleteAuthFile(client, name)))
+): Promise<{ succeeded: string[]; failed: string[] }> {
+  const results = await Promise.allSettled(
+    names.map((name) => deleteAuthFile(client, name).then(() => name))
+  )
+  const succeeded: string[] = []
+  const failed: string[] = []
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      succeeded.push(result.value)
+    } else {
+      failed.push(names[index])
+    }
+  })
+  return { succeeded, failed }
 }
 
 export async function fetchUsage(client: ApiClient): Promise<UsageResponse> {
