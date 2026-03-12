@@ -14,10 +14,9 @@ export default function BulkActionBar() {
   if (selectedCount === 0) return null
 
   const selectedFiles = files.filter((f) => selected.has(f.name))
-  const isProcessing = processing || isTesting
 
   async function handleBulkDisable() {
-    if (!client || selectedFiles.length === 0) return
+    if (!client || selectedFiles.length === 0 || processing) return
 
     setProcessing(true)
     setError(null)
@@ -59,7 +58,7 @@ export default function BulkActionBar() {
   }
 
   async function handleBulkTest() {
-    if (!client || selectedFiles.length === 0 || isTesting) return
+    if (!client || selectedFiles.length === 0 || isTesting || processing) return
 
     setError(null)
     try {
@@ -70,7 +69,7 @@ export default function BulkActionBar() {
   }
 
   async function handleBulkDelete() {
-    if (!client || selectedFiles.length === 0) return
+    if (!client || selectedFiles.length === 0 || processing) return
 
     const confirmed = window.confirm(
       `确定要删除 ${selectedFiles.length} 个认证文件吗？此操作不可撤销。`
@@ -124,7 +123,7 @@ export default function BulkActionBar() {
         <div className="flex items-center gap-2">
           <button
             onClick={handleBulkTest}
-            disabled={isProcessing}
+            disabled={isTesting || processing}
             className="h-8 px-3 rounded-md bg-blue-500/10 border border-blue-500/30 text-sm text-blue-600 hover:bg-blue-500/20 hover:border-blue-500/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {isTesting ? '测试中...' : '批量测试'}
@@ -132,7 +131,7 @@ export default function BulkActionBar() {
 
           <button
             onClick={handleBulkDisable}
-            disabled={isProcessing}
+            disabled={processing}
             className="h-8 px-3 rounded-md bg-surface border border-border text-sm text-ink hover:bg-canvas hover:border-ink disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {processing ? '处理中...' : '批量禁用'}
@@ -140,7 +139,7 @@ export default function BulkActionBar() {
 
           <button
             onClick={handleBulkDelete}
-            disabled={isProcessing}
+            disabled={processing}
             className="h-8 px-3 rounded-md bg-red-500/10 border border-red-500/30 text-sm text-red-600 hover:bg-red-500/20 hover:border-red-500/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {processing ? '处理中...' : '批量删除'}
@@ -148,7 +147,7 @@ export default function BulkActionBar() {
 
           <button
             onClick={clearSelection}
-            disabled={isProcessing}
+            disabled={false}
             className="h-8 px-3 rounded-md border border-border text-sm text-subtle hover:text-ink hover:border-ink disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             取消选择
