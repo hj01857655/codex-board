@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useCredStore } from '@/store/credStore'
-import { fetchAuthFiles, testAuthFile } from '@/lib/management'
-import { autoDisableIfQuota } from '@/lib/autoDisable'
+import { testAuthFile } from '@/lib/management'
+import { autoDisableIfQuota, autoDeleteIfExpired } from '@/lib/autoDisable'
 import { useBatchTestStore, type BatchTestStats } from '@/store/batchTestStore'
 import type { AuthFile, TestResult } from '@/types/api'
 
@@ -9,14 +9,14 @@ const PAGE_SIZE_STORAGE_KEY = 'cliproxy_page_size'
 const CONCURRENCY_OVERRIDE_STORAGE_KEY = 'cliproxy_concurrency_override'
 const DEFAULT_CONCURRENCY = 20
 const AUTO_CONCURRENCY_MAX = 64
-const RESULT_FLUSH_SIZE = 100
+const RESULT_FLUSH_SIZE = 50  // 从 100 降低到 50，更频繁刷新
 const MAX_PROGRESS_UPDATES = 500
 const LARGE_BATCH_THRESHOLD = 5000
 const HUGE_BATCH_THRESHOLD = 20000
-const HUGE_RESULT_FLUSH_SIZE = 3000
+const HUGE_RESULT_FLUSH_SIZE = 1000  // 从 3000 降低到 1000
 const HUGE_MAX_PROGRESS_UPDATES = 300
 const UI_YIELD_EVERY = 200
-const RESULT_FLUSH_INTERVAL_MS = 300
+const RESULT_FLUSH_INTERVAL_MS = 200  // 从 300ms 降低到 200ms，更快刷新
 const PROGRESS_UPDATE_INTERVAL_MS = 250
 const COMPLETED_STATUSES: Array<TestResult['status']> = ['valid', 'quota', 'expired', 'error']
 
@@ -119,7 +119,7 @@ export function useBatchTest() {
   const stats = useBatchTestStore((s) => s.stats)
   const cancelRequested = useBatchTestStore((s) => s.cancelRequested)
   const wasCancelled = useBatchTestStore((s) => s.wasCancelled)
-  const { setTestResultsBatch, updateFile, setFiles } = useCredStore.getState()
+  const { setTestResultsBatch, updateFile, removeFile } = useCredStore.getState()
 
   async function testBatch(authFiles: AuthFile[], options?: BatchTestOptions): Promise<void> {
     if (!client || useBatchTestStore.getState().isRunning || authFiles.length === 0) return
@@ -134,7 +134,9 @@ export function useBatchTest() {
     let inFlightCount = 0
     let localPeakInFlight = 0
     let autoDisabledCount = 0
+    let autoDeletedCount = 0
     const autoDisabledNames = new Set<string>()
+    const autoDeletedNames = new Set<string>()
     const localStats: BatchTestStats = {
       valid: 0,
       quota: 0,
@@ -222,16 +224,32 @@ export function useBatchTest() {
         flushProgress(false, 'dispatch')
         try {
           const result = await testAuthFile(client!, f)
-          pendingResults[f.name] = result
-          updateStats(result)
-          pendingCount += 1
-          flushPendingResults(false)
-          const disabled = await autoDisableIfQuota(client!, f, result, updateFile, {
-            optimistic: false,
-          })
-          if (disabled) {
-            autoDisabledCount += 1
-            autoDisabledNames.add(f.name)
+          
+          // 401 立即删除，不保存测试结果
+          if (result.status === 'expired' && result.statusCode === 401) {
+            const deleted = await autoDeleteIfExpired(client!, f, result, removeFile, {
+              optimistic: false,
+            })
+            if (deleted) {
+              autoDeletedCount += 1
+              autoDeletedNames.add(f.name)
+              updateStats(result)
+            }
+          } else {
+            // 其他情况保存测试结果
+            pendingResults[f.name] = result
+            updateStats(result)
+            pendingCount += 1
+            flushPendingResults(false)
+            
+            // 尝试自动禁用超额文件
+            const disabled = await autoDisableIfQuota(client!, f, result, updateFile, {
+              optimistic: false,
+            })
+            if (disabled) {
+              autoDisabledCount += 1
+              autoDisabledNames.add(f.name)
+            }
           }
         } catch {
           const errorResult: TestResult = {
@@ -262,21 +280,11 @@ export function useBatchTest() {
       } finally {
         flushPendingResults(true, true)
         flushProgress(true)
-        if (autoDisabledCount > 0) {
-          try {
-            const files = await fetchAuthFiles(client)
-            setFiles(files)
-          } catch {
-            const currentFiles = useCredStore.getState().files
-            if (currentFiles.length > 0 && autoDisabledNames.size > 0) {
-              const nextFiles = currentFiles.map((file) => {
-                if (!autoDisabledNames.has(file.name)) return file
-                return { ...file, disabled: true, status: 'disabled' as const }
-              })
-              setFiles(nextFiles)
-            }
-          }
-        }
+        // 不需要重新获取文件列表，因为：
+        // 1. 测试结果已经保存到 testResults
+        // 2. 禁用状态已经通过 updateFile 更新
+        // 3. 删除的文件已经通过 removeFile 移除
+        // 重新获取会导致测试结果丢失
         const cancelRequested = useBatchTestStore.getState().cancelRequested
         const cancelled = cancelRequested && doneCount < targets.length
         useBatchTestStore.getState().finish(cancelled, doneCount, localStats, localPeakInFlight)

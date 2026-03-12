@@ -38,6 +38,20 @@ export async function patchAuthFileStatus(
   await client.patch('/auth-files/status', { name, disabled })
 }
 
+export async function disableAuthFiles(
+  client: ApiClient,
+  names: string[]
+): Promise<void> {
+  await Promise.all(names.map((name) => patchAuthFileStatus(client, name, true)))
+}
+
+export async function deleteAuthFiles(
+  client: ApiClient,
+  names: string[]
+): Promise<void> {
+  await Promise.all(names.map((name) => deleteAuthFile(client, name)))
+}
+
 export async function fetchUsage(client: ApiClient): Promise<UsageResponse> {
   return client.get<UsageResponse>('/usage')
 }
@@ -225,7 +239,13 @@ async function testCodexFile(
       }
     }
 
-    if (res.status_code === 401 || res.status_code === 403) {
+    // 401 直接判定为过期，不重试
+    if (res.status_code === 401) {
+      return { status: 'expired', ...responseMeta(res), testedAt: now }
+    }
+
+    // 403 需要重试一次，可能是临时错误
+    if (res.status_code === 403) {
       try {
         const retryAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
         const retry = retryAttempt.response
@@ -282,7 +302,7 @@ async function testCodexFile(
         return {
           status: 'error',
           ...responseMeta(res),
-          message: `auth retry failed: ${message}`,
+          message: `403 retry failed: ${message}`,
           testedAt: now,
         }
       }
@@ -290,6 +310,79 @@ async function testCodexFile(
 
     if (res.status_code === 429) {
       return { status: 'quota', ...responseMeta(res), testedAt: now }
+    }
+
+    // 对于 502/503/504 等临时错误，重试一次
+    if (res.status_code === 502 || res.status_code === 503 || res.status_code === 504) {
+      try {
+        await sleep(1500)
+        const retryAttempt = await requestCodexUsageWithChallengeRetry(client, authFile)
+        const retry = retryAttempt.response
+
+        if (isCloudflareChallenge(retry)) {
+          return {
+            status: 'error',
+            ...responseMeta(retry),
+            message: getChallengeBlockedMessage(retryAttempt.challengeRetries),
+            testedAt: now,
+          }
+        }
+
+        if (retry.status_code === 401 || retry.status_code === 403) {
+          return { status: 'expired', ...responseMeta(retry), testedAt: now }
+        }
+        if (retry.status_code === 429) {
+          return { status: 'quota', ...responseMeta(retry), testedAt: now }
+        }
+        if (retry.status_code === 502 || retry.status_code === 503 || retry.status_code === 504) {
+          return {
+            status: 'error',
+            ...responseMeta(retry),
+            message: `${retry.status_code} after retry: ${retry.body.slice(0, 100)}`,
+            testedAt: now,
+          }
+        }
+        if (retry.status_code !== 200) {
+          return {
+            status: 'error',
+            ...responseMeta(retry),
+            message: retry.body.slice(0, 120),
+            testedAt: now,
+          }
+        }
+
+        let retryQuota: CodexQuota | undefined
+        try {
+          retryQuota = JSON.parse(retry.body) as CodexQuota
+        } catch {
+          return { status: 'valid', ...responseMeta(retry), testedAt: now }
+        }
+
+        const retryRateLimit = retryQuota.rate_limit
+        if (!retryRateLimit.allowed || retryRateLimit.limit_reached) {
+          return {
+            status: 'quota',
+            ...responseMeta(retry),
+            testedAt: now,
+            quota: retryQuota,
+          }
+        }
+
+        return {
+          status: 'valid',
+          ...responseMeta(retry),
+          testedAt: now,
+          quota: retryQuota,
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'retry failed'
+        return {
+          status: 'error',
+          ...responseMeta(res),
+          message: `${res.status_code} retry failed: ${message}`,
+          testedAt: now,
+        }
+      }
     }
 
     if (res.status_code !== 200) {
